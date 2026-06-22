@@ -84,12 +84,13 @@ class ImageCanvas(QGraphicsView):
     edit_cleared()           edit mode exited
     """
 
-    annotation_committed = pyqtSignal()
+    annotation_committed = pyqtSignal(int)   # ann_id
     stroke_finished      = pyqtSignal()
     mode_changed         = pyqtSignal(str)
     brush_size_changed   = pyqtSignal(int)
     edit_changed         = pyqtSignal()
     edit_cleared         = pyqtSignal()
+    undo_record          = pyqtSignal(object)  # dict pushed to window undo stack
 
     def __init__(self, parent=None) -> None:
         scene = QGraphicsScene()
@@ -133,6 +134,35 @@ class ImageCanvas(QGraphicsView):
         self._draft_path: Optional[QGraphicsPathItem] = None
         self._draft_line: Optional[QGraphicsLineItem] = None
         self._draft_dot: Optional[QGraphicsEllipseItem] = None
+
+    # ── undo public API ───────────────────────────────────────────────────────
+
+    def has_draft_points(self) -> bool:
+        return bool(self._draft_pts)
+
+    def undo_draw_point(self) -> None:
+        """Remove the last polygon vertex (called by window on Ctrl+Z in DRAW mode)."""
+        if not self._draft_pts:
+            return
+        self._draft_pts.pop()
+        if not self._draft_pts:
+            self._cancel_draw()
+        else:
+            self._update_draft_path()
+            if self._draft_line:
+                self.scene().removeItem(self._draft_line)
+                self._draft_line = None
+
+    def restore_pending_mask(self, mask: np.ndarray) -> None:
+        """Restore pending mask from an undo snapshot."""
+        if self._pending_mask is not None:
+            self._pending_mask[:] = mask
+            self._refresh_overlay_full()
+
+    def refresh_edit_contour(self) -> None:
+        """Refresh control-point dots after an external mask change (undo)."""
+        if self._edit_ann_id >= 0:
+            self._show_contour()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -261,6 +291,13 @@ class ImageCanvas(QGraphicsView):
             sp = self.mapToScene(event.position().toPoint())
             ci, pi = self._find_control_point(sp)
             if ci >= 0:
+                # Save undo snapshot before contour drag
+                if self._edit_mask is not None:
+                    self.undo_record.emit({
+                        "type": "edit_stroke",
+                        "ann_id": self._edit_ann_id,
+                        "mask": self._edit_mask.copy(),
+                    })
                 self._dragging_cp = (ci, pi)
                 # Switch to drag-preview polygon; hide pixel boundary
                 for item in self._cp_path_items:
@@ -271,10 +308,12 @@ class ImageCanvas(QGraphicsView):
 
         if self._mode == Mode.BRUSH:
             if event.button() == Qt.MouseButton.LeftButton:
+                self._save_brush_undo()
                 self._painting = True
                 self._stroke_erase = False
                 self._do_paint(self.mapToScene(event.position().toPoint()))
             elif event.button() == Qt.MouseButton.RightButton:
+                self._save_brush_undo()
                 self._painting = True
                 self._stroke_erase = True
                 self._do_paint(self.mapToScene(event.position().toPoint()))
@@ -530,15 +569,29 @@ class ImageCanvas(QGraphicsView):
             return
         if self._mask_manager is None or self._active_cat_id < 0:
             return
-        self._mask_manager.add_annotation(self._active_cat_id, self._pending_mask)
+        ann_id = self._mask_manager.add_annotation(self._active_cat_id, self._pending_mask)
         self._pending_mask[:] = 0
         self._refresh_overlay_full()
-        self.annotation_committed.emit()
+        self.annotation_committed.emit(ann_id)
 
     def _discard_pending(self) -> None:
         if self._pending_mask is not None and self._pending_mask.any():
             self._pending_mask[:] = 0
             self._refresh_overlay_full()
+
+    def _save_brush_undo(self) -> None:
+        """Emit a snapshot of the current mask state before a brush stroke begins."""
+        if self._edit_ann_id >= 0 and self._edit_mask is not None:
+            self.undo_record.emit({
+                "type": "edit_stroke",
+                "ann_id": self._edit_ann_id,
+                "mask": self._edit_mask.copy(),
+            })
+        elif self._pending_mask is not None:
+            self.undo_record.emit({
+                "type": "pending_brush",
+                "mask": self._pending_mask.copy(),
+            })
 
     # ── polygon draw ──────────────────────────────────────────────────────────
 

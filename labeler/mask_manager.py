@@ -39,6 +39,30 @@ class MaskManager:
     def remove_annotation(self, ann_id: int) -> None:
         self._annotations = [a for a in self._annotations if a.ann_id != ann_id]
 
+    def get_annotation(self, ann_id: int) -> Optional[Annotation]:
+        for ann in self._annotations:
+            if ann.ann_id == ann_id:
+                return ann
+        return None
+
+    def annotation_index(self, ann_id: int) -> int:
+        for i, ann in enumerate(self._annotations):
+            if ann.ann_id == ann_id:
+                return i
+        return -1
+
+    def restore_annotation(self, ann_id: int, cat_id: int,
+                           mask: np.ndarray, index: Optional[int] = None) -> None:
+        """Re-insert a previously removed annotation at its original position."""
+        self._annotations = [a for a in self._annotations if a.ann_id != ann_id]
+        ann = Annotation(ann_id, cat_id, mask.copy())
+        if index is not None:
+            idx = min(index, len(self._annotations))
+            self._annotations.insert(idx, ann)
+        else:
+            self._annotations.append(ann)
+        self._next_id = max(self._next_id, ann_id + 1)
+
     def annotations(self) -> List[Annotation]:
         return list(self._annotations)
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QSize, QSettings
+from PyQt6.QtCore import Qt, QSize, QSettings, QEvent
 from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
@@ -162,6 +162,9 @@ class MainWindow(QMainWindow):
         # image_id → MaskManager  (in-place modified during editing)
         self._mask_managers: Dict[int, MaskManager] = {}
 
+        # undo stack: list of operation dicts (cleared on image change)
+        self._undo_stack: List[dict] = []
+
         self._build_ui()
         self._connect_signals()
 
@@ -170,12 +173,16 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         mb = self.menuBar()
 
+        em = mb.addMenu("&Edit")
+        self._act_undo = QAction("&Undo", self, shortcut="Ctrl+Z")
+        em.addAction(self._act_undo)
+
         fm = mb.addMenu("&File")
         self._act_open_folder = QAction("Open &Folder…", self, shortcut="Ctrl+O")
         self._act_open_file   = QAction("Open &Image…", self)
-        self._act_load_ann    = QAction("&Load Annotations…", self)
+        self._act_load_ann    = QAction("&Load from Folder…", self)
         self._act_save        = QAction("&Save", self, shortcut="Ctrl+S")
-        self._act_save_as     = QAction("Save &As…", self, shortcut="Ctrl+Shift+S")
+        self._act_save_as     = QAction("Save to &Folder…", self, shortcut="Ctrl+Shift+S")
         for a in (self._act_open_folder, self._act_open_file, None,
                   self._act_load_ann, None,
                   self._act_save, self._act_save_as, None):
@@ -328,6 +335,7 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._lbl_status)
 
     def _connect_signals(self) -> None:
+        self._act_undo.triggered.connect(self._handle_undo)
         self._act_open_folder.triggered.connect(self._open_folder)
         self._act_open_file.triggered.connect(self._open_file)
         self._act_save.triggered.connect(self._save)
@@ -350,10 +358,12 @@ class MainWindow(QMainWindow):
         self._class_list.clicked.connect(self._on_class_clicked)
 
         self._btn_clear_label.clicked.connect(self._clear_active_label)
+        self._label_list.installEventFilter(self)
 
         self._img_list.currentRowChanged.connect(self._on_image_selected)
 
         self.canvas.annotation_committed.connect(self._on_annotation_committed)
+        self.canvas.undo_record.connect(self._push_undo)
         self.canvas.edit_changed.connect(self._mark_modified)
         self.canvas.edit_cleared.connect(self._on_edit_cleared)
         self.canvas.mode_changed.connect(self._on_mode_changed)
@@ -379,15 +389,15 @@ class MainWindow(QMainWindow):
         for f in files:
             self._img_list.addItem(f)
 
-        auto = os.path.join(folder, "annotations.json")
-        if os.path.isfile(auto):
+        # Auto-load LabelMe JSON files from the same folder
+        if files and coco_io.has_labelme_annotations(folder, files):
             try:
-                proj, mgrs = coco_io.load_coco(auto, folder)
+                proj, mgrs = coco_io.load_labelme(folder, files)
                 self.project = proj
                 self._mask_managers = mgrs
-                self.save_path = auto
+                self.save_path = folder
                 self._refresh_class_list()
-                self._lbl_status.setText("Loaded: annotations.json")
+                self._lbl_status.setText("Loaded annotations from folder")
             except Exception:
                 pass
 
@@ -413,56 +423,62 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _save(self) -> None:
-        if self.save_path is None:
+        target = self.save_path or self.image_dir
+        if not target:
             self._save_as()
             return
-        self._do_save(self.save_path)
+        self._do_save(target)
 
     def _save_as(self) -> None:
-        default = os.path.join(self.image_dir, "annotations.json")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Annotations", default, filter="JSON (*.json)"
+        default = self.image_dir or self._last_dir
+        directory = QFileDialog.getExistingDirectory(
+            self, "Save Annotations — Select Folder", default
         )
-        if not path:
+        if not directory:
             return
-        self.save_path = path
-        self._do_save(path)
+        self._do_save(directory)
 
-    def _do_save(self, path: str) -> None:
+    def _do_save(self, directory: str) -> None:
         try:
-            coco_io.save_coco(self.project, self._mask_managers, path, self.image_dir)
+            coco_io.save_labelme(self.project, self._mask_managers, directory)
+            self.save_path = directory
             self._modified = False
             self._update_title()
-            self._lbl_status.setText(f"Saved → {os.path.basename(path)}")
+            self._lbl_status.setText(f"Saved → {os.path.basename(directory)}/")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
 
     def _load_annotations(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load COCO Annotations", self.image_dir,
-            filter="JSON (*.json)"
+        default = self.image_dir or self._last_dir
+        directory = QFileDialog.getExistingDirectory(
+            self, "Load Annotations — Select JSON Folder", default
         )
-        if not path:
+        if not directory:
+            return
+        files = [self._img_list.item(i).text() for i in range(self._img_list.count())]
+        if not files:
+            QMessageBox.information(self, "No Images", "Open an image folder first.")
             return
         try:
-            proj, mgrs = coco_io.load_coco(path, self.image_dir)
+            proj, mgrs = coco_io.load_labelme(directory, files)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{e}")
             return
         self.project = proj
         self._mask_managers = mgrs
-        self.save_path = path
+        self.save_path = directory
         self._refresh_class_list()
         row = self._img_list.currentRow()
         if row >= 0:
             self._on_image_selected(row)
-        self._lbl_status.setText(f"Loaded: {os.path.basename(path)}")
+        self._lbl_status.setText(f"Loaded from: {os.path.basename(directory)}/")
 
     # ── image navigation ──────────────────────────────────────────────────────
 
     def _on_image_selected(self, row: int) -> None:
         if row < 0:
             return
+        self._undo_stack.clear()
 
         name = self._img_list.item(row).text()
         path = os.path.join(self.image_dir, name)
@@ -596,6 +612,16 @@ class MainWindow(QMainWindow):
         mgr = self._mask_managers.get(self.current_img_ann.image_id)
         if mgr is None:
             return
+        ann = mgr.get_annotation(ann_id)
+        if ann is not None:
+            self._push_undo({
+                "type": "ann_deleted",
+                "ann_id": ann.ann_id,
+                "cat_id": ann.cat_id,
+                "mask": ann.mask.copy(),
+                "index": mgr.annotation_index(ann_id),
+            })
+        self.canvas.clear_edit_annotation()
         mgr.remove_annotation(ann_id)
         self.canvas.refresh_overlay()
         self._refresh_labels()
@@ -647,7 +673,18 @@ class MainWindow(QMainWindow):
 
     # ── canvas signal handlers ────────────────────────────────────────────────
 
-    def _on_annotation_committed(self) -> None:
+    def _on_annotation_committed(self, ann_id: int) -> None:
+        if self.current_img_ann is not None:
+            mgr = self._mask_managers.get(self.current_img_ann.image_id)
+            if mgr is not None:
+                ann = mgr.get_annotation(ann_id)
+                if ann is not None:
+                    self._push_undo({
+                        "type": "ann_added",
+                        "ann_id": ann_id,
+                        "cat_id": ann.cat_id,
+                        "mask": ann.mask.copy(),
+                    })
         self._refresh_labels()
         self._mark_modified()
 
@@ -690,6 +727,77 @@ class MainWindow(QMainWindow):
         self._label_list.blockSignals(False)
         self._clear_label_bold()
         self._on_mode_changed(self.canvas.current_mode)
+
+    # ── undo ──────────────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._label_list and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Delete:
+                self._clear_active_label()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _push_undo(self, record: dict) -> None:
+        self._undo_stack.append(record)
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+
+    def _handle_undo(self) -> None:
+        """Ctrl+Z dispatcher: polygon-point undo is canvas-local, rest via undo stack."""
+        if self.canvas.current_mode == "draw" and self.canvas.has_draft_points():
+            self.canvas.undo_draw_point()
+        else:
+            self._do_undo()
+
+    def _do_undo(self) -> None:
+        if not self._undo_stack:
+            return
+        record = self._undo_stack.pop()
+        t = record["type"]
+
+        if t == "pending_brush":
+            self.canvas.restore_pending_mask(record["mask"])
+
+        elif t == "edit_stroke":
+            ann_id = record["ann_id"]
+            if self.current_img_ann is None:
+                return
+            mgr = self._mask_managers.get(self.current_img_ann.image_id)
+            if mgr is None:
+                return
+            ann = mgr.get_annotation(ann_id)
+            if ann is not None:
+                ann.mask[:] = record["mask"]
+                self.canvas.refresh_overlay()
+                self.canvas.refresh_edit_contour()
+            self._mark_modified()
+
+        elif t == "ann_added":
+            ann_id = record["ann_id"]
+            if self.current_img_ann is None:
+                return
+            mgr = self._mask_managers.get(self.current_img_ann.image_id)
+            if mgr is None:
+                return
+            self.canvas.clear_edit_annotation()
+            mgr.remove_annotation(ann_id)
+            self.canvas.refresh_overlay()
+            self._refresh_labels()
+            self._mark_modified()
+
+        elif t == "ann_deleted":
+            if self.current_img_ann is None:
+                return
+            mgr = self._mask_managers.get(self.current_img_ann.image_id)
+            if mgr is None:
+                return
+            mgr.restore_annotation(
+                record["ann_id"], record["cat_id"],
+                record["mask"], record.get("index"),
+            )
+            self.canvas.refresh_overlay()
+            self._refresh_labels()
+            self._mark_modified()
 
     def _set_label_bold(self, row: int) -> None:
         for i in range(self._label_list.count()):
