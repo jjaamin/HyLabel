@@ -63,6 +63,17 @@ class MaskManager:
             self._annotations.append(ann)
         self._next_id = max(self._next_id, ann_id + 1)
 
+    def change_annotation_category(self, ann_id: int, new_cat_id: int) -> bool:
+        for ann in self._annotations:
+            if ann.ann_id == ann_id:
+                ann.cat_id = new_cat_id
+                return True
+        return False
+
+    def sort_by_category_order(self, cat_order: List[int]) -> None:
+        order_map = {cat_id: i for i, cat_id in enumerate(cat_order)}
+        self._annotations.sort(key=lambda a: order_map.get(a.cat_id, len(cat_order)))
+
     def annotations(self) -> List[Annotation]:
         return list(self._annotations)
 

@@ -135,6 +135,49 @@ class ImageCanvas(QGraphicsView):
         self._draft_line: Optional[QGraphicsLineItem] = None
         self._draft_dot: Optional[QGraphicsEllipseItem] = None
 
+        # gamma / faint-mode
+        self._original_pixmap: Optional[QPixmap] = None
+        self._gamma_lut: Optional[np.ndarray] = None
+        self._gamma_enabled: bool = False
+        self._faint_mode: bool = False
+
+    # ── faint / gamma public API ─────────────────────────────────────────────
+
+    def set_faint_mode(self, faint: bool) -> None:
+        self._faint_mode = faint
+        if self._overlay_item is not None:
+            self._overlay_item.setOpacity(0.12 if faint else 1.0)
+
+    def set_gamma_lut(self, lut: np.ndarray) -> None:
+        self._gamma_lut = lut
+        self._apply_pixmap_gamma()
+
+    def set_gamma_enabled(self, enabled: bool) -> None:
+        self._gamma_enabled = enabled
+        self._apply_pixmap_gamma()
+
+    def _apply_pixmap_gamma(self) -> None:
+        if self._pixmap_item is None or self._original_pixmap is None:
+            return
+        if self._gamma_enabled and self._gamma_lut is not None:
+            pm = self._gamma_apply(self._original_pixmap, self._gamma_lut)
+        else:
+            pm = self._original_pixmap
+        self._pixmap_item.setPixmap(pm)
+
+    def _gamma_apply(self, pixmap: QPixmap, lut: np.ndarray) -> QPixmap:
+        img = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32)
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(h * img.bytesPerLine())
+        arr = np.frombuffer(ptr, dtype=np.uint8).copy().reshape(h, w, 4)
+        # Format_RGB32 (little-endian): byte order is B, G, R, FF
+        arr[:, :, 0] = lut[arr[:, :, 0]]
+        arr[:, :, 1] = lut[arr[:, :, 1]]
+        arr[:, :, 2] = lut[arr[:, :, 2]]
+        out = QImage(arr.data, w, h, img.bytesPerLine(), QImage.Format.Format_RGB32)
+        return QPixmap.fromImage(out.copy())
+
     # ── undo public API ───────────────────────────────────────────────────────
 
     def has_draft_points(self) -> bool:
@@ -175,6 +218,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_contour()
 
         pixmap = QPixmap(path)
+        self._original_pixmap = pixmap
         scene = self.scene()
         for item in (self._pixmap_item, self._overlay_item,
                      self._contour_overlay, self._brush_ring):
@@ -183,12 +227,15 @@ class ImageCanvas(QGraphicsView):
 
         self._pixmap_item = scene.addPixmap(pixmap)
         self._pixmap_item.setZValue(0)
+        self._apply_pixmap_gamma()
         w, h = pixmap.width(), pixmap.height()
         scene.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
 
         self._overlay_item = _MaskOverlayItem(w, h)
         scene.addItem(self._overlay_item)
+        if self._faint_mode:
+            self._overlay_item.setOpacity(0.12)
 
         self._contour_overlay = _MaskOverlayItem(w, h)
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)

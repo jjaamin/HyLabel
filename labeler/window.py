@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import Qt, QSize, QSettings, QEvent
 from PyQt6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
+    QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
     QLabel, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QSlider, QSplitter, QStatusBar,
     QToolBar, QVBoxLayout, QWidget,
@@ -15,6 +15,7 @@ from .canvas import ImageCanvas, Mode
 from .mask_manager import MaskManager
 from .models import Project
 from . import coco_io
+from .gamma_dialog import GammaCurveDialog, compute_lut
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -156,6 +157,11 @@ class MainWindow(QMainWindow):
         self.save_path: Optional[str] = None
         self._settings = QSettings("LabelEditor", "LabelEditor")
         self._last_dir: str = self._settings.value("lastDir", "")
+        y0 = int(self._settings.value("gammaY0", 0))
+        y1 = int(self._settings.value("gammaY1", 128))
+        y2 = int(self._settings.value("gammaY2", 255))
+        self._gamma_ctrl = [(0, y0), (128, y1), (255, y2)]
+        self._gamma_dialog: Optional[GammaCurveDialog] = None
         self.current_img_ann = None
         self._modified = False
 
@@ -167,6 +173,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self.canvas.set_gamma_lut(compute_lut(self._gamma_ctrl))
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -191,6 +198,13 @@ class MainWindow(QMainWindow):
         self._act_fit      = QAction("&Fit Image", self, shortcut="F")
         for a in (self._act_zoom_in, self._act_zoom_out, self._act_fit):
             vm.addAction(a)
+        vm.addSeparator()
+        self._act_faint = QAction("&Faint Labels", self, shortcut="V", checkable=True)
+        self._act_gamma = QAction("Apply &Gamma",  self, shortcut="G", checkable=True)
+        self._act_gamma_curve = QAction("Gamma Cur&ve…", self)
+        vm.addAction(self._act_faint)
+        vm.addAction(self._act_gamma)
+        vm.addAction(self._act_gamma_curve)
 
         em = mb.addMenu("&Edit")
         self._act_undo = QAction("&Undo", self, shortcut="Ctrl+Z")
@@ -308,18 +322,21 @@ class MainWindow(QMainWindow):
         lav = QVBoxLayout(lg)
         self._label_list = QListWidget()
         self._label_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        self._label_list.setMaximumHeight(140)
         lav.addWidget(self._label_list)
         self._btn_clear_label = QPushButton("Delete Selected Label")
         lav.addWidget(self._btn_clear_label)
-        rv.addWidget(lg)
+        self._label_class_combo = QComboBox()
+        self._label_class_combo.setEnabled(False)
+        self._label_class_combo.setToolTip("Change class of selected label")
+        lav.addWidget(self._label_class_combo)
+        rv.addWidget(lg, 1)
 
-        # Images section (below Clear Active Layer)
+        # Images section
         img_lbl = QLabel("Images")
         img_lbl.setStyleSheet("margin-top: 4px;")
         rv.addWidget(img_lbl)
         self._img_list = QListWidget()
-        rv.addWidget(self._img_list)
+        rv.addWidget(self._img_list, 1)
 
         splitter.addWidget(right)
         splitter.setSizes([1050, 230])
@@ -347,6 +364,9 @@ class MainWindow(QMainWindow):
         self._act_zoom_in.triggered.connect(lambda: self.canvas.scale(1.2, 1.2))
         self._act_zoom_out.triggered.connect(lambda: self.canvas.scale(1 / 1.2, 1 / 1.2))
         self._act_fit.triggered.connect(self.canvas.fit_view)
+        self._act_faint.triggered.connect(self._toggle_faint)
+        self._act_gamma.triggered.connect(self._toggle_gamma)
+        self._act_gamma_curve.triggered.connect(self._open_gamma_dialog)
 
         self._brush_slider.valueChanged.connect(self._on_slider_changed)
         self.canvas.brush_size_changed.connect(self._sync_slider)
@@ -359,6 +379,7 @@ class MainWindow(QMainWindow):
 
         self._btn_clear_label.clicked.connect(self._clear_active_label)
         self._label_list.installEventFilter(self)
+        self._label_class_combo.currentIndexChanged.connect(self._on_label_class_changed)
 
         self._img_list.currentRowChanged.connect(self._on_image_selected)
 
@@ -637,6 +658,7 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, ann.ann_id)
             self._label_list.addItem(item)
         self._label_list.blockSignals(False)
+        self._update_label_class_combo()
 
     def _clear_active_label(self) -> None:
         """Remove the selected annotation from this image."""
@@ -724,6 +746,7 @@ class MainWindow(QMainWindow):
                         "mask": ann.mask.copy(),
                     })
         self._refresh_labels()
+        self._label_list.scrollToBottom()
         self._mark_modified()
 
     def _on_class_clicked(self, _) -> None:
@@ -733,6 +756,7 @@ class MainWindow(QMainWindow):
     def _on_label_selected(self, row: int) -> None:
         if row < 0 or self.current_img_ann is None:
             self.canvas.clear_edit_annotation()
+            self._update_label_class_combo()
             return
         item = self._label_list.item(row)
         if item is None:
@@ -758,12 +782,14 @@ class MainWindow(QMainWindow):
                 self._set_label_bold(row)
                 self._clear_class_bold()
                 break
+        self._update_label_class_combo()
 
     def _on_edit_cleared(self) -> None:
         self._label_list.blockSignals(True)
         self._label_list.clearSelection()
         self._label_list.blockSignals(False)
         self._clear_label_bold()
+        self._update_label_class_combo()
         self._on_mode_changed(self.canvas.current_mode)
 
     # ── undo ──────────────────────────────────────────────────────────────────
@@ -870,6 +896,98 @@ class MainWindow(QMainWindow):
         self._lbl_mode.setText(labels.get(mode_str, f"Mode: {mode_str}"))
         if mode_str == "idle":
             self._uncheck_all_tools()
+
+    # ── faint / gamma ─────────────────────────────────────────────────────────
+
+    def _toggle_faint(self) -> None:
+        self.canvas.set_faint_mode(self._act_faint.isChecked())
+
+    def _toggle_gamma(self) -> None:
+        self.canvas.set_gamma_enabled(self._act_gamma.isChecked())
+
+    def _open_gamma_dialog(self) -> None:
+        if self._gamma_dialog is not None:
+            self._gamma_dialog.show()
+            self._gamma_dialog.raise_()
+            self._gamma_dialog.activateWindow()
+            return
+        self._gamma_dialog = GammaCurveDialog(self._gamma_ctrl, self)
+        self._gamma_dialog.lut_changed.connect(self._on_gamma_lut_changed)
+        self._gamma_dialog.show()
+
+    def _on_gamma_lut_changed(self, lut: object) -> None:
+        if self._gamma_dialog is not None:
+            self._gamma_ctrl = self._gamma_dialog.control_points()
+            self._settings.setValue("gammaY0", self._gamma_ctrl[0][1])
+            self._settings.setValue("gammaY1", self._gamma_ctrl[1][1])
+            self._settings.setValue("gammaY2", self._gamma_ctrl[2][1])
+        self.canvas.set_gamma_lut(lut)  # type: ignore[arg-type]
+
+    # ── label class change ────────────────────────────────────────────────────
+
+    def _update_label_class_combo(self) -> None:
+        self._label_class_combo.blockSignals(True)
+        self._label_class_combo.clear()
+        row = self._label_list.currentRow()
+        if row < 0 or self.current_img_ann is None:
+            self._label_class_combo.setEnabled(False)
+            self._label_class_combo.blockSignals(False)
+            return
+        item = self._label_list.item(row)
+        if item is None:
+            self._label_class_combo.setEnabled(False)
+            self._label_class_combo.blockSignals(False)
+            return
+        ann_id = item.data(Qt.ItemDataRole.UserRole)
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            self._label_class_combo.setEnabled(False)
+            self._label_class_combo.blockSignals(False)
+            return
+        ann = mgr.get_annotation(ann_id)
+        if ann is None:
+            self._label_class_combo.setEnabled(False)
+            self._label_class_combo.blockSignals(False)
+            return
+        self._label_class_combo.setEnabled(True)
+        for cat in self.project.categories:
+            self._label_class_combo.addItem(_color_icon(cat.color, 12), cat.name, cat.id)
+        for i in range(self._label_class_combo.count()):
+            if self._label_class_combo.itemData(i) == ann.cat_id:
+                self._label_class_combo.setCurrentIndex(i)
+                break
+        self._label_class_combo.blockSignals(False)
+
+    def _on_label_class_changed(self, idx: int) -> None:
+        if idx < 0 or self.current_img_ann is None:
+            return
+        new_cat_id = self._label_class_combo.itemData(idx)
+        if new_cat_id is None:
+            return
+        row = self._label_list.currentRow()
+        if row < 0:
+            return
+        item = self._label_list.item(row)
+        if item is None:
+            return
+        ann_id = item.data(Qt.ItemDataRole.UserRole)
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            return
+        ann = mgr.get_annotation(ann_id)
+        if ann is None or ann.cat_id == new_cat_id:
+            return
+        mgr.change_annotation_category(ann_id, new_cat_id)
+        cat_order = [c.id for c in self.project.categories]
+        mgr.sort_by_category_order(cat_order)
+        self.canvas.refresh_overlay()
+        self._refresh_labels()
+        for i in range(self._label_list.count()):
+            it = self._label_list.item(i)
+            if it and it.data(Qt.ItemDataRole.UserRole) == ann_id:
+                self._label_list.setCurrentRow(i)
+                break
+        self._mark_modified()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
