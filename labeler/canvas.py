@@ -146,7 +146,7 @@ class ImageCanvas(QGraphicsView):
     def set_faint_mode(self, faint: bool) -> None:
         self._faint_mode = faint
         if self._overlay_item is not None:
-            self._overlay_item.setOpacity(0.22 if faint else 1.0)
+            self._overlay_item.setOpacity(0.22 if faint else 0.88)
 
     def set_gamma_lut(self, lut: np.ndarray) -> None:
         self._gamma_lut = lut
@@ -234,8 +234,7 @@ class ImageCanvas(QGraphicsView):
 
         self._overlay_item = _MaskOverlayItem(w, h)
         scene.addItem(self._overlay_item)
-        if self._faint_mode:
-            self._overlay_item.setOpacity(0.22)
+        self._overlay_item.setOpacity(0.22 if self._faint_mode else 0.88)
 
         self._contour_overlay = _MaskOverlayItem(w, h)
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)
