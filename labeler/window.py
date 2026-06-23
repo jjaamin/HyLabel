@@ -139,7 +139,7 @@ def _emoji_icon(symbol: str, size: int = 21) -> QIcon:
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
-    f = p.font()
+    f = QFont("Segoe UI Emoji")
     f.setPixelSize(int(size * 0.82))
     p.setFont(f)
     p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
