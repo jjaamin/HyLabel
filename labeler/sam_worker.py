@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-WEIGHTS_FILENAME = "edge_sam_3x_vi_t_sam.pth"
+WEIGHTS_FILENAME = "edge_sam_3x.pth"
 WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "weights")
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, WEIGHTS_FILENAME)
 
