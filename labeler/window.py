@@ -755,8 +755,14 @@ class MainWindow(QMainWindow):
                         "cat_id": ann.cat_id,
                         "mask": ann.mask.copy(),
                     })
+                cat_order = [c.id for c in self.project.categories]
+                mgr.sort_by_category_order(cat_order)
         self._refresh_labels()
-        self._label_list.scrollToBottom()
+        for i in range(self._label_list.count()):
+            it = self._label_list.item(i)
+            if it and it.data(Qt.ItemDataRole.UserRole) == ann_id:
+                self._label_list.scrollToItem(it)
+                break
         self._mark_modified()
 
     def _on_class_clicked(self, _) -> None:
