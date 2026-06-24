@@ -202,17 +202,12 @@ class MaskManager:
             if not ann.mask.any():
                 continue
             contours, _ = cv2.findContours(
-                ann.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
+                ann.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
             for c in contours:
                 if len(c) < 3:
                     continue
-                arc = cv2.arcLength(c, True)
-                eps = max(1.0, 0.003 * arc)
-                approx = cv2.approxPolyDP(c, eps, True)
-                if len(approx) < 3:
-                    continue
-                flat = approx.reshape(-1).tolist()
+                flat = c.reshape(-1).tolist()
                 xs, ys = flat[0::2], flat[1::2]
                 bx, by = min(xs), min(ys)
                 results.append({
