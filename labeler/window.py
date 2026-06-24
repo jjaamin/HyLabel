@@ -1262,10 +1262,16 @@ class MainWindow(QMainWindow):
         if not self._modified:
             return True
         reply = QMessageBox.question(
-            self, "Unsaved Changes", "Discard unsaved changes?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self, "Unsaved Changes",
+            "저장하지 않은 변경 사항이 있습니다.",
+            QMessageBox.StandardButton.Save |
+            QMessageBox.StandardButton.Discard |
+            QMessageBox.StandardButton.Cancel,
         )
-        return reply == QMessageBox.StandardButton.Yes
+        if reply == QMessageBox.StandardButton.Save:
+            self._save()
+            return not self._modified  # False if save was itself cancelled
+        return reply == QMessageBox.StandardButton.Discard
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
