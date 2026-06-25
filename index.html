@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Label Editor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8f8f8;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+
+    header {
+      background: #1a1a1a;
+      color: #fff;
+      padding: 48px 0 40px;
+      text-align: center;
+    }
+    header h1 { font-size: 2rem; font-weight: 600; letter-spacing: -0.5px; }
+    header p  { margin-top: 8px; color: #aaa; font-size: 0.95rem; }
+
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 56px 24px 80px;
+    }
+
+    /* ── section ── */
+    section { margin-bottom: 56px; }
+    section h2 {
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #999;
+      margin-bottom: 20px;
+    }
+
+    /* ── tool cards ── */
+    .tools {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 12px;
+    }
+    .tool {
+      background: #fff;
+      border: 1px solid #e8e8e8;
+      border-radius: 10px;
+      padding: 20px 18px;
+    }
+    .tool-key {
+      display: inline-block;
+      background: #1a1a1a;
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-bottom: 10px;
+      font-family: monospace;
+    }
+    .tool h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 6px; }
+    .tool p  { font-size: 0.83rem; color: #666; }
+
+    /* ── shortcut table ── */
+    .shortcuts {
+      background: #fff;
+      border: 1px solid #e8e8e8;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .shortcut-row {
+      display: flex;
+      align-items: center;
+      padding: 12px 20px;
+      border-bottom: 1px solid #f0f0f0;
+      gap: 16px;
+    }
+    .shortcut-row:last-child { border-bottom: none; }
+    .shortcut-row:nth-child(even) { background: #fafafa; }
+    .key-badge {
+      font-family: monospace;
+      font-size: 0.78rem;
+      font-weight: 700;
+      background: #f0f0f0;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 2px 8px;
+      white-space: nowrap;
+      min-width: 72px;
+      text-align: center;
+    }
+    .shortcut-desc { font-size: 0.875rem; color: #444; }
+
+    /* ── flow ── */
+    .flow {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0;
+    }
+    .flow-step {
+      background: #fff;
+      border: 1px solid #e8e8e8;
+      border-radius: 8px;
+      padding: 14px 18px;
+      font-size: 0.875rem;
+    }
+    .flow-step strong { display: block; font-size: 0.78rem; color: #999; margin-bottom: 2px; }
+    .arrow {
+      color: #ccc;
+      font-size: 1.2rem;
+      padding: 0 8px;
+    }
+
+    /* ── note ── */
+    .note {
+      background: #fff;
+      border-left: 3px solid #1a1a1a;
+      border-radius: 0 8px 8px 0;
+      padding: 14px 18px;
+      font-size: 0.875rem;
+      color: #555;
+      margin-bottom: 10px;
+    }
+    .note + .note { margin-top: -2px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Label Editor</h1>
+  <p>이미지 어노테이션 도구 · LabelMe 형식 호환</p>
+</header>
+
+<main>
+
+  <!-- 도구 -->
+  <section>
+    <h2>도구</h2>
+    <div class="tools">
+      <div class="tool">
+        <span class="tool-key">D</span>
+        <h3>폴리곤 그리기</h3>
+        <p>꼭짓점을 클릭해 다각형을 그립니다. 첫 점 근처 클릭 또는 더블클릭으로 닫기.</p>
+      </div>
+      <div class="tool">
+        <span class="tool-key">B</span>
+        <h3>브러시</h3>
+        <p>좌클릭으로 칠하고 우클릭으로 지웁니다. <code>[ ]</code>로 크기 조절.</p>
+      </div>
+      <div class="tool">
+        <span class="tool-key">M</span>
+        <h3>AI 매직완드</h3>
+        <p>클릭 한 번으로 영역 자동 인식 (EdgeSAM). <code>[ ]</code>로 마스크 후보 선택.</p>
+      </div>
+      <div class="tool">
+        <span class="tool-key">H</span>
+        <h3>Pan</h3>
+        <p>이미지를 이동합니다. 한 번 더 누르면 이전 도구로 복귀.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 기본 사용 흐름 -->
+  <section>
+    <h2>기본 흐름</h2>
+    <div class="flow">
+      <div class="flow-step"><strong>1</strong>폴더 열기<br><code>Ctrl+O</code></div>
+      <span class="arrow">→</span>
+      <div class="flow-step"><strong>2</strong>클래스 추가<br>우측 패널</div>
+      <span class="arrow">→</span>
+      <div class="flow-step"><strong>3</strong>도구 선택<br>D / B / M</div>
+      <span class="arrow">→</span>
+      <div class="flow-step"><strong>4</strong>마스크 확정<br>Enter</div>
+      <span class="arrow">→</span>
+      <div class="flow-step"><strong>5</strong>저장<br><code>Ctrl+S</code></div>
+    </div>
+  </section>
+
+  <!-- 레이블 편집 -->
+  <section>
+    <h2>레이블 편집</h2>
+    <div class="notes">
+      <div class="note">우측 <strong>Labels</strong> 패널에서 레이블 클릭 → 편집 모드 진입</div>
+      <div class="note">꼭짓점(노란 점)을 드래그해 윤곽선 조정 — 브러시 모드에서는 비활성화</div>
+      <div class="note"><strong>B</strong> + 브러시 페인팅으로 마스크 직접 수정</div>
+      <div class="note"><strong>Esc</strong> 로 편집 모드 종료</div>
+    </div>
+  </section>
+
+  <!-- 단축키 -->
+  <section>
+    <h2>단축키</h2>
+    <div class="shortcuts">
+      <div class="shortcut-row"><span class="key-badge">D</span><span class="shortcut-desc">폴리곤 그리기</span></div>
+      <div class="shortcut-row"><span class="key-badge">B</span><span class="shortcut-desc">브러시</span></div>
+      <div class="shortcut-row"><span class="key-badge">M</span><span class="shortcut-desc">AI 매직완드</span></div>
+      <div class="shortcut-row"><span class="key-badge">H</span><span class="shortcut-desc">Pan · 한 번 더 누르면 이전 도구 복귀</span></div>
+      <div class="shortcut-row"><span class="key-badge">Space</span><span class="shortcut-desc">누르는 동안 임시 Pan</span></div>
+      <div class="shortcut-row"><span class="key-badge">[ / ]</span><span class="shortcut-desc">브러시 크기 조절 · 매직완드 마스크 후보 선택</span></div>
+      <div class="shortcut-row"><span class="key-badge">Enter</span><span class="shortcut-desc">마스크 확정</span></div>
+      <div class="shortcut-row"><span class="key-badge">Esc</span><span class="shortcut-desc">취소 · 편집 모드 종료</span></div>
+      <div class="shortcut-row"><span class="key-badge">Ctrl+Z</span><span class="shortcut-desc">실행 취소</span></div>
+      <div class="shortcut-row"><span class="key-badge">Ctrl+S</span><span class="shortcut-desc">저장</span></div>
+      <div class="shortcut-row"><span class="key-badge">Ctrl+O</span><span class="shortcut-desc">폴더 열기</span></div>
+      <div class="shortcut-row"><span class="key-badge">F</span><span class="shortcut-desc">이미지 맞춤 (Fit)</span></div>
+      <div class="shortcut-row"><span class="key-badge">= / -</span><span class="shortcut-desc">확대 / 축소</span></div>
+      <div class="shortcut-row"><span class="key-badge">V</span><span class="shortcut-desc">레이블 흐리게 보기 토글</span></div>
+      <div class="shortcut-row"><span class="key-badge">G</span><span class="shortcut-desc">감마 보정 토글</span></div>
+      <div class="shortcut-row"><span class="key-badge">Delete</span><span class="shortcut-desc">선택된 레이블 삭제 (Labels 패널 포커스 중)</span></div>
+    </div>
+  </section>
+
+  <!-- 저장 -->
+  <section>
+    <h2>저장</h2>
+    <div class="notes">
+      <div class="note">이미지당 하나의 <code>.json</code> 파일 · LabelMe 형식 호환</div>
+      <div class="note">어노테이션이 없는 이미지는 JSON 파일을 생성하지 않음</div>
+      <div class="note">이미지 목록의 📄 아이콘 — 해당 이미지의 JSON 존재 여부 표시</div>
+      <div class="note">종료 또는 새 폴더 열 때 미저장 변경사항이 있으면 Save / Discard / Cancel 창 표시</div>
+    </div>
+  </section>
+
+</main>
+
+</body>
+</html>
