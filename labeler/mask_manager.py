@@ -194,7 +194,7 @@ class MaskManager:
             result.append([(float(p[0][0]) + 0.5, float(p[0][1]) + 0.5) for p in c])
         return result
 
-    # ── COCO I/O ──────────────────────────────────────────────────────────────
+    # ── LabelMe I/O ───────────────────────────────────────────────────────────
 
     def to_coco_annotations(self, image_id: int) -> List[dict]:
         results = []

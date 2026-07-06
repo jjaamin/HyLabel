@@ -1,8 +1,8 @@
 """
-COCO 저장·로드 검증 스크립트.
+LabelMe 저장·로드 검증 스크립트.
 
 검증 항목:
-  1. 개별 annotation이 각자 분리된 COCO entry로 저장되는지
+  1. 개별 annotation이 각자 분리된 LabelMe entry로 저장되는지
   2. category_id / image_id / bbox / area 필드가 올바른지
   3. segmentation polygon을 다시 래스터화하면 원본 mask와 일치하는지
   4. 여러 category·여러 annotation이 뒤섞이지 않는지
