@@ -1,6 +1,6 @@
 ﻿# HyLabel
 
-이미지 어노테이션 도구 (LabelMe 형식)
+이미지 어노테이션 도구 (LabelMe Format)
 
 ---
 
