@@ -124,6 +124,7 @@ class ImageCanvas(QGraphicsView):
         self._cp_path_items: List[QGraphicsPathItem] = []   # drag preview only
         self._cp_dot_items: List[List[QGraphicsEllipseItem]] = []
         self._dragging_cp: Tuple[int, int] = (-1, -1)
+        self._class_dot_items: List[QGraphicsEllipseItem] = []  # read-only class overview
 
         self._mode = Mode.IDLE
         self._active_cat_id: int = -1
@@ -228,6 +229,7 @@ class ImageCanvas(QGraphicsView):
         self._edit_ann_id = -1
         self._edit_mask = None
         self._clear_contour()
+        self.clear_class_contours()
 
         pixmap = QPixmap(path)
         self._original_pixmap = pixmap
@@ -270,6 +272,7 @@ class ImageCanvas(QGraphicsView):
         self._edit_mask = None
         self._pending_polygons = None
         self._clear_contour()
+        self.clear_class_contours()
         if mgr:
             self._pending_mask = np.zeros((mgr.height, mgr.width), dtype=np.uint8)
         else:
@@ -340,6 +343,7 @@ class ImageCanvas(QGraphicsView):
     def set_edit_annotation(self, ann_id: int, mask: np.ndarray) -> None:
         """Enter edit mode: brush and point-drag will modify this annotation."""
         self._discard_pending()
+        self.clear_class_contours()
         self._edit_ann_id = ann_id
         self._edit_mask = mask
         self._show_contour()
@@ -627,6 +631,31 @@ class ImageCanvas(QGraphicsView):
         self._cp_dot_items = []
         self._cp_contours = []
         self._dragging_cp = (-1, -1)
+
+    def show_class_contours(self, masks: List[np.ndarray]) -> None:
+        """Show read-only contour dots for all annotations of the selected class."""
+        self.clear_class_contours()
+        if not self._pixmap_item:
+            return
+        pen = QPen(QColor(255, 255, 255, 220), 1.2)
+        pen.setCosmetic(True)
+        r = 3
+        for mask in masks:
+            for cp_pts in MaskManager.extract_cp_contours(mask):
+                for x, y in cp_pts:
+                    dot = QGraphicsEllipseItem(-r, -r, r * 2, r * 2)
+                    dot.setPen(pen)
+                    dot.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+                    dot.setPos(x, y)
+                    dot.setZValue(30)
+                    self.scene().addItem(dot)
+                    self._class_dot_items.append(dot)
+
+    def clear_class_contours(self) -> None:
+        for dot in self._class_dot_items:
+            self.scene().removeItem(dot)
+        self._class_dot_items = []
 
     def _find_control_point(self, sp: QPointF) -> Tuple[int, int]:
         """Return (contour_idx, point_idx) of nearest control point within CP_SNAP, or (-1,-1)."""

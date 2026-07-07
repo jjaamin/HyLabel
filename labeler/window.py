@@ -800,6 +800,7 @@ class MainWindow(QMainWindow):
         self.canvas.refresh_overlay()
         self._refresh_labels()
         self._mark_modified()
+        self._show_class_contours()
 
     # ── tool toggling ─────────────────────────────────────────────────────────
 
@@ -897,10 +898,25 @@ class MainWindow(QMainWindow):
                 self._label_list.scrollToItem(it)
                 break
         self._mark_modified()
+        self._show_class_contours()
 
     def _on_class_clicked(self, _) -> None:
         self.canvas.clear_edit_annotation()
         self._clear_label_bold()
+        self._show_class_contours()
+
+    def _show_class_contours(self) -> None:
+        row = self._class_list.currentRow()
+        if row < 0 or self.current_img_ann is None:
+            self.canvas.clear_class_contours()
+            return
+        cat_id = self._class_list.item(row).data(Qt.ItemDataRole.UserRole)
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            self.canvas.clear_class_contours()
+            return
+        masks = [ann.mask for ann in mgr.annotations() if ann.cat_id == cat_id]
+        self.canvas.show_class_contours(masks)
 
     def _select_last_label(self) -> None:
         count = self._label_list.count()
@@ -956,6 +972,7 @@ class MainWindow(QMainWindow):
         self._update_label_class_combo()
         self._update_class_bold(self._class_list.currentRow())
         self._on_mode_changed(self.canvas.current_mode)
+        self._show_class_contours()
 
     # ── undo ──────────────────────────────────────────────────────────────────
 
