@@ -5,15 +5,24 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 
+WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "weights")
+
 ENCODER_FILENAME = "edge_sam_3x_encoder.onnx"
 DECODER_FILENAME = "edge_sam_3x_decoder.onnx"
-WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "weights")
 ENCODER_PATH = os.path.join(WEIGHTS_DIR, ENCODER_FILENAME)
 DECODER_PATH = os.path.join(WEIGHTS_DIR, DECODER_FILENAME)
+
+SAM2_ENCODER_FILENAME = "sam2_hiera_tiny.encoder.onnx"
+SAM2_DECODER_FILENAME = "sam2_hiera_tiny.decoder.onnx"
+SAM2_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_ENCODER_FILENAME)
+SAM2_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_DECODER_FILENAME)
 
 _PIXEL_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)[None, :, None, None]
 _PIXEL_STD  = np.array([58.395,  57.12,  57.375],  dtype=np.float32)[None, :, None, None]
 _IMG_SIZE   = 1024
+
+_SAM2_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_SAM2_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def is_installed() -> bool:
@@ -136,3 +145,132 @@ class EdgeSAMPredictor:
         masks = (m > 0).transpose(2, 0, 1)             # (3, oh, ow) bool
 
         return masks, scores
+
+
+class SAM2Predictor:
+    """ONNX Runtime based SAM2 (Hiera) predictor.
+
+    Matches the vietanhdev/samexporter ONNX export: a square-resize image
+    encoder producing (high_res_feats_0, high_res_feats_1, image_embedding),
+    and a prompt decoder consuming those plus point/mask prompts. Decoder
+    I/O is bound positionally (not by name), matching that export's own
+    inference code.
+    """
+
+    def __init__(self, encoder_path: str, decoder_path: str) -> None:
+        import onnxruntime as ort
+
+        try:
+            import torch
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if torch_lib not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        except ImportError:
+            pass
+
+        providers = []
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+
+        self._enc = ort.InferenceSession(encoder_path, providers=providers)
+        self._dec = ort.InferenceSession(decoder_path, providers=providers)
+
+        enc_inputs = self._enc.get_inputs()
+        self._enc_input_name   = enc_inputs[0].name
+        self._enc_output_names = [o.name for o in self._enc.get_outputs()]
+        enc_shape = enc_inputs[0].shape
+        self._input_hw = (int(enc_shape[2]), int(enc_shape[3]))   # (ih, iw)
+
+        self._dec_input_names  = [i.name for i in self._dec.get_inputs()]
+        self._dec_output_names = [o.name for o in self._dec.get_outputs()]
+
+        self._embeddings = None            # [high_res_feats_0, high_res_feats_1, image_embedding]
+        self._orig_size: Tuple[int, int] = (0, 0)
+
+    @property
+    def device(self) -> str:
+        p = self._enc.get_providers()
+        return "CUDA" if "CUDAExecutionProvider" in p else "CPU"
+
+    def set_image(self, image_rgb: np.ndarray) -> None:
+        h, w = image_rgb.shape[:2]
+        self._orig_size = (h, w)
+        ih, iw = self._input_hw
+
+        resized = cv2.resize(image_rgb, (iw, ih))
+        x = resized.astype(np.float32) / 255.0
+        x = (x - _SAM2_MEAN) / _SAM2_STD
+        x = x.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+
+        self._embeddings = self._enc.run(self._enc_output_names, {self._enc_input_name: x})
+
+    def predict(
+        self,
+        points: List[Tuple[int, int]],
+        labels: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (masks [K,H,W] bool, scores [K] float32)."""
+        if self._embeddings is None:
+            raise RuntimeError("set_image() must be called before predict()")
+
+        ih, iw = self._input_hw
+        oh, ow = self._orig_size
+
+        coords = np.array(points, dtype=np.float32)
+        coords[..., 0] = coords[..., 0] / ow * iw
+        coords[..., 1] = coords[..., 1] / oh * ih
+        coords = coords[np.newaxis]                       # [1, N, 2]
+        lbls = np.array(labels, dtype=np.float32)[np.newaxis]  # [1, N]
+
+        mask_input = np.zeros((lbls.shape[0], 1, ih // 4, iw // 4), dtype=np.float32)
+        has_mask_input = np.array([0], dtype=np.float32)
+
+        # Encoder output order: high_res_feats_0, high_res_feats_1, image_embedding.
+        # Decoder input order:  image_embedding, high_res_feats_0, high_res_feats_1,
+        #                       point_coords, point_labels, mask_input, has_mask_input.
+        hr0, hr1, image_embed = self._embeddings
+        feed_values = [image_embed, hr0, hr1, coords, lbls, mask_input, has_mask_input]
+        feed = dict(zip(self._dec_input_names, feed_values))
+
+        out = self._dec.run(self._dec_output_names, feed)
+        masks_raw = out[0][0]           # (K, ih, iw) logits
+        scores = out[1].reshape(-1)     # (K,)
+
+        k = masks_raw.shape[0]
+        resized = np.stack([
+            cv2.resize(masks_raw[i], (ow, oh), interpolation=cv2.INTER_LINEAR)
+            for i in range(k)
+        ])
+        masks = resized > 0.0           # (K, oh, ow) bool
+
+        return masks, scores.astype(np.float32)
+
+
+MODEL_EDGESAM = "edgesam"
+MODEL_SAM2 = "sam2"
+
+MODEL_INFO = {
+    MODEL_EDGESAM: {
+        "label": "EdgeSAM",
+        "encoder": ENCODER_PATH,
+        "decoder": DECODER_PATH,
+        "cls": EdgeSAMPredictor,
+    },
+    MODEL_SAM2: {
+        "label": "SAM2 (Hiera-Tiny)",
+        "encoder": SAM2_ENCODER_PATH,
+        "decoder": SAM2_DECODER_PATH,
+        "cls": SAM2Predictor,
+    },
+}
+
+
+def missing_weights(model_key: str) -> List[str]:
+    info = MODEL_INFO[model_key]
+    return [p for p in (info["encoder"], info["decoder"]) if not os.path.exists(p)]
+
+
+def create_predictor(model_key: str):
+    info = MODEL_INFO[model_key]
+    return info["cls"](info["encoder"], info["decoder"])

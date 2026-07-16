@@ -18,10 +18,12 @@ pip install -r requirements.txt
 
 ### 2. AI 매직완드 모델 다운로드 (선택)
 
-AI 매직완드(EdgeSAM) 기능을 사용하려면 모델 가중치가 필요합니다.
+AI 매직완드 기능은 **EdgeSAM**과 **SAM2 (Hiera-Tiny)** 중 골라서 사용할 수 있습니다 (사이드바 "AI Model" 드롭다운). 사용할 모델의 가중치를 받아야 합니다.
 
 ```bash
-python download_weights.py
+python download_weights.py                 # EdgeSAM (기본값)
+python download_weights.py --model sam2    # SAM2 (Hiera-Tiny)
+python download_weights.py --model all     # 둘 다
 ```
 
 **GPU 가속 사용 시** (CUDA 12.x + cuDNN 9):
@@ -145,7 +147,7 @@ Labels 패널에서 레이블을 선택한 뒤 `B`를 눌러 기존 마스크를
 
 ### AI 매직완드 도구 (`M`)
 
-EdgeSAM 모델을 이용한 자동 마스크 생성입니다.
+EdgeSAM 또는 SAM2 (Hiera-Tiny) 모델을 이용한 자동 마스크 생성입니다. 사이드바의 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
 
 - **좌클릭**: 포함할 영역 지정 (초록 점)
 - **우클릭**: 제외할 영역 지정 (빨간 점)
@@ -153,7 +155,7 @@ EdgeSAM 모델을 이용한 자동 마스크 생성입니다.
 - **Enter**: 마스크 확정
 - **Esc**: 초기화
 
-> 모델 가중치(`download_weights.py`)와 `onnxruntime` 패키지가 필요합니다.
+> 선택한 모델의 가중치(`download_weights.py --model <edgesam|sam2>`)와 `onnxruntime` 패키지가 필요합니다.
 
 ---
 
@@ -199,7 +201,7 @@ Labels 패널에서 레이블 클릭 시 편집 모드 진입:
 ```
 HyLabel/
 ├── run_hylabel.py          # 실행 진입점
-├── download_weights.py     # EdgeSAM 모델 다운로드
+├── download_weights.py     # AI 매직완드 모델(EdgeSAM/SAM2) 다운로드
 ├── requirements.txt        # 패키지 목록
 └── labeler/
     ├── main.py             # 앱 초기화

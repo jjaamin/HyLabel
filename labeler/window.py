@@ -255,6 +255,9 @@ class MainWindow(QMainWindow):
         self._gamma_dialog: Optional[GammaCurveDialog] = None
         self._sam_predictor: Optional[object] = None
         self._sam_img_path: str = ""
+        self._sam_model_key: str = self._settings.value("samModel", sam_worker.MODEL_EDGESAM)
+        if self._sam_model_key not in sam_worker.MODEL_INFO:
+            self._sam_model_key = sam_worker.MODEL_EDGESAM
         self.current_img_ann = None
         self._modified = False
         self._pre_pan_action: Optional[QAction] = None
@@ -401,6 +404,22 @@ class MainWindow(QMainWindow):
         sh.addWidget(self._brush_size_lbl)
         rv.addWidget(size_widget)
 
+        # Model row (AI Magic Wand)
+        model_widget = QWidget()
+        mow = QHBoxLayout(model_widget)
+        mow.setContentsMargins(4, 2, 4, 2)
+        model_lbl = QLabel("AI Model:")
+        model_lbl.setStyleSheet("font-size: 13px;")
+        mow.addWidget(model_lbl)
+        self._sam_model_combo = QComboBox()
+        for key, info in sam_worker.MODEL_INFO.items():
+            self._sam_model_combo.addItem(info["label"], key)
+        idx = self._sam_model_combo.findData(self._sam_model_key)
+        self._sam_model_combo.setCurrentIndex(max(0, idx))
+        self._sam_model_combo.setToolTip("AI Magic Wand model")
+        mow.addWidget(self._sam_model_combo, 1)
+        rv.addWidget(model_widget)
+
         # Mask index row (AI Magic Wand)
         mask_widget = QWidget()
         mh = QHBoxLayout(mask_widget)
@@ -503,6 +522,7 @@ class MainWindow(QMainWindow):
         self._act_brush_inc.triggered.connect(lambda: self._adjust_size(+1))
         self._act_pan_toggle.triggered.connect(self._toggle_pan)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
+        self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
 
         self._btn_add_cls.clicked.connect(self._add_class)
         self._btn_rem_cls.clicked.connect(self._remove_class)
@@ -1080,7 +1100,20 @@ class MainWindow(QMainWindow):
         if mode_str == "idle":
             self._uncheck_all_tools()
 
-    # ── AI magic wand (EdgeSAM) ───────────────────────────────────────────────
+    # ── AI magic wand (EdgeSAM / SAM2) ──────────────────────────────────────────
+
+    def _on_sam_model_changed(self, combo_idx: int) -> None:
+        key = self._sam_model_combo.itemData(combo_idx)
+        if key is None or key == self._sam_model_key:
+            return
+        self._sam_model_key = key
+        self._settings.setValue("samModel", key)
+        self._sam_predictor = None
+        self._sam_img_path = ""
+        self._mask_slider.setEnabled(False)
+        self.canvas.clear_magic(keep_pending=False)
+        label = sam_worker.MODEL_INFO[key]["label"]
+        self._lbl_status.setText(f"AI model switched to {label}")
 
     def _on_mask_slider_changed(self, idx: int) -> None:
         self._mask_idx_lbl.setText(f"{idx + 1}/3")
@@ -1111,6 +1144,8 @@ class MainWindow(QMainWindow):
     def _ensure_sam_loaded(self) -> bool:
         if self._sam_predictor is not None:
             return True
+        key = self._sam_model_key
+        label = sam_worker.MODEL_INFO[key]["label"]
         if not sam_worker.is_installed():
             QMessageBox.warning(
                 self, "onnxruntime not installed",
@@ -1118,24 +1153,22 @@ class MainWindow(QMainWindow):
                 "Run:  pip install onnxruntime-gpu",
             )
             return False
-        enc = sam_worker.ENCODER_PATH
-        dec = sam_worker.DECODER_PATH
-        missing = [p for p in (enc, dec) if not os.path.exists(p)]
+        missing = sam_worker.missing_weights(key)
         if missing:
             QMessageBox.warning(
                 self, "Weights not found",
-                "EdgeSAM ONNX weights not found.\n\n"
-                "Run:  python download_weights.py\n\n"
+                f"{label} ONNX weights not found.\n\n"
+                f"Run:  python download_weights.py --model {key}\n\n"
                 "Expected:\n" + "\n".join(f"  {p}" for p in missing),
             )
             return False
-        self._lbl_status.setText("Loading EdgeSAM model…")
+        self._lbl_status.setText(f"Loading {label} model…")
         QApplication.processEvents()
         self.setCursor(Qt.CursorShape.WaitCursor)
         try:
-            self._sam_predictor = sam_worker.EdgeSAMPredictor(enc, dec)
+            self._sam_predictor = sam_worker.create_predictor(key)
             device = self._sam_predictor.device  # type: ignore[union-attr]
-            self._lbl_status.setText(f"EdgeSAM loaded  ({device})")
+            self._lbl_status.setText(f"{label} loaded  ({device})")
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             self.setCursor(Qt.CursorShape.ArrowCursor)
