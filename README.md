@@ -40,12 +40,16 @@ pip install -r requirements.txt
 
 ### 4. AI 매직완드 모델 다운로드 (선택)
 
-AI 매직완드 기능은 **EdgeSAM**과 **SAM2 (Hiera-Tiny)** 중 골라서 사용할 수 있습니다 (사이드바 "AI Model" 드롭다운). 사용할 모델의 가중치를 받아야 합니다. (이 기능을 안 쓸 거면 건너뛰어도 앱은 정상 실행됨)
+AI 매직완드 기능은 **EdgeSAM**과 **SAM2**(Hiera-Tiny / Base+ / Large) 중 골라서 사용할 수 있습니다 (사이드바 "AI Model" 드롭다운). 사용할 모델의 가중치를 받아야 합니다. (이 기능을 안 쓸 거면 건너뛰어도 앱은 정상 실행됨)
+
+SAM2는 크기가 클수록 배경 오검출이 줄고 정확해지지만 느려지고 가중치도 커집니다. Hiera-Tiny에서 배경이 같이 잡히는 경우 Base+ 또는 Large를 시도해보세요.
 
 ```bash
-python download_weights.py                 # EdgeSAM (기본값)
-python download_weights.py --model sam2    # SAM2 (Hiera-Tiny)
-python download_weights.py --model all     # 둘 다
+python download_weights.py                       # EdgeSAM (기본값)
+python download_weights.py --model sam2           # SAM2 (Hiera-Tiny, ~134MB)
+python download_weights.py --model sam2_base_plus # SAM2 (Hiera-Base+, ~340MB)
+python download_weights.py --model sam2_large     # SAM2 (Hiera-Large, ~889MB)
+python download_weights.py --model all            # 전부
 ```
 
 **GPU 가속 사용 시** (NVIDIA GPU + CUDA 12.x):
@@ -179,7 +183,7 @@ Labels 패널에서 레이블을 선택한 뒤 `B`를 눌러 기존 마스크를
 
 ### AI 매직완드 도구 (`M`)
 
-EdgeSAM 또는 SAM2 (Hiera-Tiny) 모델을 이용한 자동 마스크 생성입니다. 사이드바의 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
+EdgeSAM 또는 SAM2 (Hiera-Tiny / Base+ / Large) 모델을 이용한 자동 마스크 생성입니다. 사이드바의 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
 
 - **좌클릭**: 포함할 영역 지정 (초록 점)
 - **우클릭**: 제외할 영역 지정 (빨간 점)
@@ -187,7 +191,7 @@ EdgeSAM 또는 SAM2 (Hiera-Tiny) 모델을 이용한 자동 마스크 생성입�
 - **Enter**: 마스크 확정
 - **Esc**: 초기화
 
-> 선택한 모델의 가중치(`download_weights.py --model <edgesam|sam2>`)와 `onnxruntime` 패키지가 필요합니다.
+> 선택한 모델의 가중치(`download_weights.py --model <edgesam|sam2|sam2_base_plus|sam2_large>`)와 `onnxruntime` 패키지가 필요합니다.
 
 ---
 
@@ -242,7 +246,7 @@ HyLabel/
     ├── mask_manager.py     # 마스크 저장/렌더링
     ├── coco_io.py          # JSON 저장/불러오기
     ├── models.py           # 데이터 모델
-    ├── sam_worker.py       # EdgeSAM ONNX 추론
+    ├── sam_worker.py       # EdgeSAM/SAM2 ONNX 추론
     ├── gamma_dialog.py     # 감마 커브 UI
-    └── weights/            # EdgeSAM 모델 가중치 (다운로드 후 생성)
+    └── weights/            # AI 매직완드 모델 가중치 (다운로드 후 생성)
 ```

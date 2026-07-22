@@ -17,11 +17,21 @@ MODEL_FILES = {
         ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_tiny.encoder.onnx", "sam2_hiera_tiny.encoder.onnx"),
         ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_tiny.decoder.onnx", "sam2_hiera_tiny.decoder.onnx"),
     ],
+    "sam2_base_plus": [
+        ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_base_plus.encoder.onnx", "sam2_hiera_base_plus.encoder.onnx"),
+        ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_base_plus.decoder.onnx", "sam2_hiera_base_plus.decoder.onnx"),
+    ],
+    "sam2_large": [
+        ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_large.encoder.onnx", "sam2_hiera_large.encoder.onnx"),
+        ("vietanhdev/segment-anything-2-onnx-models", "model", "sam2_hiera_large.decoder.onnx", "sam2_hiera_large.decoder.onnx"),
+    ],
 }
 
 HF_MANUAL_URLS = {
     "edgesam": "https://huggingface.co/spaces/chongzhou/EdgeSAM",
     "sam2": "https://huggingface.co/vietanhdev/segment-anything-2-onnx-models",
+    "sam2_base_plus": "https://huggingface.co/vietanhdev/segment-anything-2-onnx-models",
+    "sam2_large": "https://huggingface.co/vietanhdev/segment-anything-2-onnx-models",
 }
 
 
@@ -85,12 +95,12 @@ def download_model(model_key: str) -> list:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--model", choices=["edgesam", "sam2", "all"], default="edgesam",
+        "--model", choices=["edgesam", "sam2", "sam2_base_plus", "sam2_large", "all"], default="edgesam",
         help="Which model's weights to download (default: edgesam)",
     )
     args = parser.parse_args()
 
-    models = ["edgesam", "sam2"] if args.model == "all" else [args.model]
+    models = list(MODEL_FILES.keys()) if args.model == "all" else [args.model]
 
     all_failed = {}
     for model_key in models:

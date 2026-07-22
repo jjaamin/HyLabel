@@ -17,6 +17,16 @@ SAM2_DECODER_FILENAME = "sam2_hiera_tiny.decoder.onnx"
 SAM2_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_ENCODER_FILENAME)
 SAM2_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_DECODER_FILENAME)
 
+SAM2_BASE_PLUS_ENCODER_FILENAME = "sam2_hiera_base_plus.encoder.onnx"
+SAM2_BASE_PLUS_DECODER_FILENAME = "sam2_hiera_base_plus.decoder.onnx"
+SAM2_BASE_PLUS_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_BASE_PLUS_ENCODER_FILENAME)
+SAM2_BASE_PLUS_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_BASE_PLUS_DECODER_FILENAME)
+
+SAM2_LARGE_ENCODER_FILENAME = "sam2_hiera_large.encoder.onnx"
+SAM2_LARGE_DECODER_FILENAME = "sam2_hiera_large.decoder.onnx"
+SAM2_LARGE_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_LARGE_ENCODER_FILENAME)
+SAM2_LARGE_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_LARGE_DECODER_FILENAME)
+
 _PIXEL_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)[None, :, None, None]
 _PIXEL_STD  = np.array([58.395,  57.12,  57.375],  dtype=np.float32)[None, :, None, None]
 _IMG_SIZE   = 1024
@@ -249,6 +259,8 @@ class SAM2Predictor:
 
 MODEL_EDGESAM = "edgesam"
 MODEL_SAM2 = "sam2"
+MODEL_SAM2_BASE_PLUS = "sam2_base_plus"
+MODEL_SAM2_LARGE = "sam2_large"
 
 MODEL_INFO = {
     MODEL_EDGESAM: {
@@ -261,6 +273,18 @@ MODEL_INFO = {
         "label": "SAM2 (Hiera-Tiny)",
         "encoder": SAM2_ENCODER_PATH,
         "decoder": SAM2_DECODER_PATH,
+        "cls": SAM2Predictor,
+    },
+    MODEL_SAM2_BASE_PLUS: {
+        "label": "SAM2 (Hiera-Base+)",
+        "encoder": SAM2_BASE_PLUS_ENCODER_PATH,
+        "decoder": SAM2_BASE_PLUS_DECODER_PATH,
+        "cls": SAM2Predictor,
+    },
+    MODEL_SAM2_LARGE: {
+        "label": "SAM2 (Hiera-Large)",
+        "encoder": SAM2_LARGE_ENCODER_PATH,
+        "decoder": SAM2_LARGE_DECODER_PATH,
         "cls": SAM2Predictor,
     },
 }
