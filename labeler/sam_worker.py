@@ -43,6 +43,29 @@ def is_installed() -> bool:
         return False
 
 
+def _make_session(path: str, providers: List[str]):
+    """Build an InferenceSession with ONNX Runtime's warning chatter silenced.
+
+    These exported models produce warnings we cannot act on:
+      - at load, from graph.cc — shape-merge fallbacks ("Error merging shape
+        info ... Falling back to lenient merge") and unused-initializer notices,
+        both artifacts of how the models were exported to ONNX;
+      - at inference on CUDA, from scatter_nd.h — a generic caveat that
+        ScatterND is only exact when indices are not duplicated.
+
+    Severity 3 is Error, so real failures are still reported; only Warning and
+    below are dropped. Two knobs are needed because the load-time messages go to
+    the session logger while the CUDA kernel ones go to the process-wide default
+    logger, which session options do not reach.
+    """
+    import onnxruntime as ort
+
+    ort.set_default_logger_severity(3)
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    return ort.InferenceSession(path, sess_options=opts, providers=providers)
+
+
 class _ResizeLongestSide:
     def __init__(self, target: int = _IMG_SIZE) -> None:
         self._target = target
@@ -85,8 +108,8 @@ class EdgeSAMPredictor:
             providers.append("CUDAExecutionProvider")
         providers.append("CPUExecutionProvider")
 
-        self._enc = ort.InferenceSession(encoder_path, providers=providers)
-        self._dec = ort.InferenceSession(decoder_path, providers=providers)
+        self._enc = _make_session(encoder_path, providers)
+        self._dec = _make_session(decoder_path, providers)
         self._tf  = _ResizeLongestSide()
         self._features:   np.ndarray | None = None
         self._input_size: Tuple[int, int]   = (0, 0)
@@ -183,8 +206,8 @@ class SAM2Predictor:
             providers.append("CUDAExecutionProvider")
         providers.append("CPUExecutionProvider")
 
-        self._enc = ort.InferenceSession(encoder_path, providers=providers)
-        self._dec = ort.InferenceSession(decoder_path, providers=providers)
+        self._enc = _make_session(encoder_path, providers)
+        self._dec = _make_session(decoder_path, providers)
 
         enc_inputs = self._enc.get_inputs()
         self._enc_input_name   = enc_inputs[0].name
