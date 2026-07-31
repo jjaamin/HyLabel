@@ -256,7 +256,7 @@ class MainWindow(QMainWindow):
         self._sam_predictor: Optional[object] = None
         self._sam_img_path: str = ""
         self._sam_model_key: str = self._settings.value("samModel", sam_worker.MODEL_EDGESAM)
-        if self._sam_model_key not in sam_worker.MODEL_INFO:
+        if self._sam_model_key not in sam_worker.visible_models():
             self._sam_model_key = sam_worker.MODEL_EDGESAM
         self.current_img_ann = None
         self._modified = False
@@ -412,8 +412,8 @@ class MainWindow(QMainWindow):
         model_lbl.setStyleSheet("font-size: 13px;")
         mow.addWidget(model_lbl)
         self._sam_model_combo = QComboBox()
-        for key, info in sam_worker.MODEL_INFO.items():
-            self._sam_model_combo.addItem(info["label"], key)
+        for key in sam_worker.visible_models():
+            self._sam_model_combo.addItem(sam_worker.MODEL_INFO[key]["label"], key)
         idx = self._sam_model_combo.findData(self._sam_model_key)
         self._sam_model_combo.setCurrentIndex(max(0, idx))
         self._sam_model_combo.setToolTip("AI Magic Wand model")

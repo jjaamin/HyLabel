@@ -274,12 +274,14 @@ MODEL_INFO = {
         "encoder": SAM2_ENCODER_PATH,
         "decoder": SAM2_DECODER_PATH,
         "cls": SAM2Predictor,
+        "hidden": True,
     },
     MODEL_SAM2_BASE_PLUS: {
         "label": "SAM2 (Hiera-Base+)",
         "encoder": SAM2_BASE_PLUS_ENCODER_PATH,
         "decoder": SAM2_BASE_PLUS_DECODER_PATH,
         "cls": SAM2Predictor,
+        "hidden": True,
     },
     MODEL_SAM2_LARGE: {
         "label": "SAM2 (Hiera-Large)",
@@ -288,6 +290,11 @@ MODEL_INFO = {
         "cls": SAM2Predictor,
     },
 }
+
+
+def visible_models() -> List[str]:
+    """Model keys to offer in the UI, in MODEL_INFO order (hidden ones excluded)."""
+    return [key for key, info in MODEL_INFO.items() if not info.get("hidden")]
 
 
 def missing_weights(model_key: str) -> List[str]:
