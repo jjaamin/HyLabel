@@ -1194,7 +1194,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "onnxruntime not installed",
                 "onnxruntime is required for AI Magic Wand.\n\n"
-                "Run:  pip install onnxruntime-gpu",
+                "Run:  pip install onnxruntime\n\n"
+                "With an NVIDIA GPU, install onnxruntime-gpu instead "
+                "(see README, install step 4).",
             )
             return False
         missing = sam_worker.missing_weights(key)

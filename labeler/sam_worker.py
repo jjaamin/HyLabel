@@ -27,6 +27,13 @@ SAM2_LARGE_DECODER_FILENAME = "sam2_hiera_large.decoder.onnx"
 SAM2_LARGE_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_LARGE_ENCODER_FILENAME)
 SAM2_LARGE_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_LARGE_DECODER_FILENAME)
 
+# SAM 2.1 keeps SAM 2's architecture and ONNX signature — same encoder/decoder
+# tensor names, shapes and dtypes — so SAM2Predictor drives it unchanged.
+SAM2_1_LARGE_ENCODER_FILENAME = "sam2.1_hiera_large.encoder.onnx"
+SAM2_1_LARGE_DECODER_FILENAME = "sam2.1_hiera_large.decoder.onnx"
+SAM2_1_LARGE_ENCODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_1_LARGE_ENCODER_FILENAME)
+SAM2_1_LARGE_DECODER_PATH = os.path.join(WEIGHTS_DIR, SAM2_1_LARGE_DECODER_FILENAME)
+
 _PIXEL_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)[None, :, None, None]
 _PIXEL_STD  = np.array([58.395,  57.12,  57.375],  dtype=np.float32)[None, :, None, None]
 _IMG_SIZE   = 1024
@@ -284,6 +291,7 @@ MODEL_EDGESAM = "edgesam"
 MODEL_SAM2 = "sam2"
 MODEL_SAM2_BASE_PLUS = "sam2_base_plus"
 MODEL_SAM2_LARGE = "sam2_large"
+MODEL_SAM2_1_LARGE = "sam2_1_large"
 
 MODEL_INFO = {
     MODEL_EDGESAM: {
@@ -310,6 +318,12 @@ MODEL_INFO = {
         "label": "SAM2 (Hiera-Large)",
         "encoder": SAM2_LARGE_ENCODER_PATH,
         "decoder": SAM2_LARGE_DECODER_PATH,
+        "cls": SAM2Predictor,
+    },
+    MODEL_SAM2_1_LARGE: {
+        "label": "SAM2.1 (Hiera-Large)",
+        "encoder": SAM2_1_LARGE_ENCODER_PATH,
+        "decoder": SAM2_1_LARGE_DECODER_PATH,
         "cls": SAM2Predictor,
     },
 }

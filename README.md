@@ -5,7 +5,7 @@
 **주요 기능**
 
 - 폴리곤 / 브러시 기반 세그멘테이션 라벨링
-- SAM 계열(EdgeSAM · SAM2) AI 매직완드로 클릭 한두 번에 마스크 자동 생성
+- SAM 계열(EdgeSAM · SAM2 · SAM2.1) AI 매직완드로 클릭 한두 번에 마스크 자동 생성
 - 클래스 · 레이블 · 이미지 관리 패널
 - 마스크 오버레이 렌더링, 감마 보정 등 보기 편의 기능
 
@@ -47,30 +47,46 @@ pip install -r requirements.txt
 
 AI 매직완드는 클릭 한두 번으로 마스크를 자동 생성하는 기능입니다. 이 기능을 쓰지 않을 거면 이 단계를 건너뛰어도 앱은 정상 실행됩니다.
 
-사이드바 **AI Model** 드롭다운에서 모델을 고를 수 있으며, 현재 선택지는 **EdgeSAM**과 **SAM2 (Hiera-Large)** 두 가지입니다. 사용할 모델의 가중치를 미리 받아둬야 합니다.
+사이드바 **AI Model** 드롭다운에서 모델을 고를 수 있습니다. 현재 선택지는 **EdgeSAM**, **SAM2 (Hiera-Large)**, **SAM2.1 (Hiera-Large)** 세 가지이며, 사용할 모델의 가중치를 미리 받아둬야 합니다.
 
 ```bash
-python download_weights.py                    # EdgeSAM (기본값, ~40MB)
-python download_weights.py --model sam2_large # SAM2 Hiera-Large (~890MB)
+python download_weights.py                      # EdgeSAM (기본값, ~40MB)
+python download_weights.py --model sam2_large    # SAM2 Hiera-Large (~890MB)
+python download_weights.py --model sam2_1_large  # SAM2.1 Hiera-Large (~870MB)
 ```
 
-- **EdgeSAM**: 가볍고 빠름. 간단한 대상에 적합.
-- **SAM2 (Hiera-Large)**: 정확도가 가장 높아 배경 오검출이 적음. 대신 무겁고 느림.
+- **EdgeSAM**: 가볍고 빠름. 간단한 대상에 적합. **GPU 없는 PC에서는 사실상 이 모델을 써야 합니다** (아래 CPU 항목 참고).
+- **SAM2 (Hiera-Large)**: 정확도가 높아 배경 오검출이 적음. 대신 무겁고 느림.
+- **SAM2.1 (Hiera-Large)**: SAM2와 아키텍처가 같은 개선판. 자체 TEM 이미지 비교에서는 SAM2와 정확도·속도가 사실상 동등했으므로, 둘 중 아무거나 쓰셔도 됩니다.
 
 > 이전에 실험용으로 지원했던 SAM2 Hiera-Tiny / Base+는 Large 대비 성능이 떨어져 드롭다운에서 숨겼습니다. 필요하면 `--model sam2` 또는 `--model sam2_base_plus`로 가중치를 받고 `labeler/sam_worker.py`의 `MODEL_INFO`에서 `"hidden": True`를 지우면 다시 노출됩니다.
 
-**GPU 가속 사용 시** (NVIDIA GPU + CUDA 12.x):
+#### CPU 전용 PC (GPU 없는 회사 PC 등)
+
+**추가 설치는 필요 없습니다.** `requirements.txt`의 `onnxruntime`이 CPU용 패키지라 3번 단계만으로 매직완드가 동작합니다. GPU가 없으면 앱이 자동으로 CPU로 실행됩니다 (모델 로드 후 상태바에 `(CPU)` 표시).
+
+다만 **모델 선택이 중요합니다.** 553×555 TEM 이미지 기준 실측:
+
+| 모델 | 이미지 인코딩 | 클릭당 예측 |
+|---|---|---|
+| EdgeSAM | **0.3초** | 39ms |
+| SAM2 / SAM2.1 (Hiera-Large) | **5.9초** | 33ms |
+
+인코딩은 이미지당 한 번만 수행되고 이후 클릭은 캐시를 씁니다. 하지만 SAM2 계열은 **이미지를 바꿀 때마다 약 6초간 창이 대기 커서로 멈춥니다** (추론이 메인 스레드에서 실행됨). 이미지를 자주 넘기며 작업한다면 CPU PC에서는 EdgeSAM을 권합니다.
+
+GPU가 있는 PC에서는 같은 인코딩이 0.24초라 SAM2 계열도 쾌적합니다.
+
+#### GPU 가속 사용 시 (NVIDIA GPU + CUDA 12.x)
+
 ```bash
 pip install onnxruntime-gpu==1.20.1
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 onnxruntime-gpu는 cuDNN 9가 필요한데, 위처럼 PyTorch(CUDA 빌드)를 같이 설치해두면 앱이 PyTorch에 번들된 `cudnn64_9.dll`을 자동으로 찾아 쓰므로 cuDNN을 별도로 설치할 필요가 없습니다. PyTorch를 설치하지 않으면 cuDNN을 직접 설치해야 GPU 가속이 동작합니다.
 
-**CPU 전용 (GPU 없는 회사 PC 등):**
-```bash
-pip install onnxruntime
-```
-그냥 `requirements.txt`에 이미 포함되어 있으므로 2번 단계로 충분하며, 별도 조치 불필요.
+> `onnxruntime`(CPU)과 `onnxruntime-gpu`를 함께 설치해도 무방합니다. GPU 빌드가 우선 사용되며, CUDA를 못 찾으면 자동으로 CPU로 내려갑니다.
+
+> **`onnxruntime_providers_cuda.dll` 로드 실패 빨간 에러가 뜬다면** — `onnxruntime-gpu`는 설치됐는데 CUDA/cuDNN을 못 찾은 경우입니다. 앱은 그대로 CPU로 동작하므로 치명적이지 않습니다. GPU 가속이 필요하면 위의 PyTorch(CUDA 빌드)를 설치하고, 필요 없으면 `pip uninstall onnxruntime-gpu`로 에러를 없앨 수 있습니다.
 
 ### 5. 설치 확인
 
@@ -212,7 +228,7 @@ Labels 패널에서 레이블을 선택한 뒤 `B`를 눌러 기존 마스크를
 
 ### AI 매직완드 도구 (`M`)
 
-EdgeSAM 또는 SAM2 (Hiera-Large) 모델로 마스크를 자동 생성합니다. 사이드바 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
+EdgeSAM · SAM2 · SAM2.1 모델로 마스크를 자동 생성합니다. 사이드바 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
 
 - **좌클릭**: 포함할 영역 지정 (초록 점)
 - **우클릭**: 제외할 영역 지정 (빨간 점)
@@ -266,7 +282,7 @@ Labels 패널에서 레이블 클릭 시 편집 모드 진입:
 ```
 HyLabel/
 ├── run_hylabel.py          # 실행 진입점
-├── download_weights.py     # AI 매직완드 모델(EdgeSAM/SAM2) 다운로드
+├── download_weights.py     # AI 매직완드 모델(EdgeSAM/SAM2/SAM2.1) 다운로드
 ├── requirements.txt        # 패키지 목록
 └── labeler/
     ├── main.py             # 앱 초기화
@@ -275,7 +291,7 @@ HyLabel/
     ├── mask_manager.py     # 마스크 저장/렌더링
     ├── coco_io.py          # JSON 저장/불러오기
     ├── models.py           # 데이터 모델
-    ├── sam_worker.py       # EdgeSAM/SAM2 ONNX 추론
+    ├── sam_worker.py       # EdgeSAM/SAM2/SAM2.1 ONNX 추론
     ├── gamma_dialog.py     # 감마 커브 UI
     └── weights/            # AI 매직완드 모델 가중치 (다운로드 후 생성)
 ```
