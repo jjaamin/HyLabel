@@ -1,10 +1,15 @@
 ﻿# HyLabel
 
-이미지 어노테이션 도구 (LabelMe Format)
+세그멘테이션 마스크 라벨링 도구. 폴리곤 · 브러시 · AI 매직완드로 마스크를 그리고 **LabelMe JSON** 형식으로 저장합니다.
 
----
+**주요 기능**
 
-DMI 영상응용계측기술팀 구자민 TL
+- 폴리곤 / 브러시 기반 세그멘테이션 라벨링
+- SAM 계열(EdgeSAM · SAM2) AI 매직완드로 클릭 한두 번에 마스크 자동 생성
+- 클래스 · 레이블 · 이미지 관리 패널
+- 마스크 오버레이 렌더링, 감마 보정 등 보기 편의 기능
+
+> DMI 영상응용계측기술팀 · 구자민 TL
 
 ---
 
@@ -40,17 +45,19 @@ pip install -r requirements.txt
 
 ### 4. AI 매직완드 모델 다운로드 (선택)
 
-AI 매직완드 기능은 **EdgeSAM**과 **SAM2**(Hiera-Tiny / Base+ / Large) 중 골라서 사용할 수 있습니다 (사이드바 "AI Model" 드롭다운). 사용할 모델의 가중치를 받아야 합니다. (이 기능을 안 쓸 거면 건너뛰어도 앱은 정상 실행됨)
+AI 매직완드는 클릭 한두 번으로 마스크를 자동 생성하는 기능입니다. 이 기능을 쓰지 않을 거면 이 단계를 건너뛰어도 앱은 정상 실행됩니다.
 
-SAM2는 크기가 클수록 배경 오검출이 줄고 정확해지지만 느려지고 가중치도 커집니다. Hiera-Tiny에서 배경이 같이 잡히는 경우 Base+ 또는 Large를 시도해보세요.
+사이드바 **AI Model** 드롭다운에서 모델을 고를 수 있으며, 현재 선택지는 **EdgeSAM**과 **SAM2 (Hiera-Large)** 두 가지입니다. 사용할 모델의 가중치를 미리 받아둬야 합니다.
 
 ```bash
-python download_weights.py                       # EdgeSAM (기본값)
-python download_weights.py --model sam2           # SAM2 (Hiera-Tiny, ~134MB)
-python download_weights.py --model sam2_base_plus # SAM2 (Hiera-Base+, ~340MB)
-python download_weights.py --model sam2_large     # SAM2 (Hiera-Large, ~889MB)
-python download_weights.py --model all            # 전부
+python download_weights.py                    # EdgeSAM (기본값, ~40MB)
+python download_weights.py --model sam2_large # SAM2 Hiera-Large (~890MB)
 ```
+
+- **EdgeSAM**: 가볍고 빠름. 간단한 대상에 적합.
+- **SAM2 (Hiera-Large)**: 정확도가 가장 높아 배경 오검출이 적음. 대신 무겁고 느림.
+
+> 이전에 실험용으로 지원했던 SAM2 Hiera-Tiny / Base+는 Large 대비 성능이 떨어져 드롭다운에서 숨겼습니다. 필요하면 `--model sam2` 또는 `--model sam2_base_plus`로 가중치를 받고 `labeler/sam_worker.py`의 `MODEL_INFO`에서 `"hidden": True`를 지우면 다시 노출됩니다.
 
 **GPU 가속 사용 시** (NVIDIA GPU + CUDA 12.x):
 ```bash
@@ -85,19 +92,25 @@ python run_hylabel.py
 ## 화면 구성
 
 ```
-┌─────────────────────────────────┬──────────────────┐
-│  좌측 툴바                        │  우측 패널       │
-│                                  │  - Brush 크기    │
-│  캔버스 (이미지 + 마스크 오버레이)   │  - Mask 선택    │
-│                                  │  - Classes       │
-│                                  │  - Labels        │
-│                                  │  - Images 목록   │
-└─────────────────────────────────┴──────────────────┘
+┌────────┬──────────────────────────────┬─────────────────┐
+│        │                              │  우측 패널       │
+│  좌측  │  캔버스                       │  - Brush 크기    │
+│  툴바  │  (이미지 + 마스크 오버레이)     │  - Mask 선택     │
+│        │                              │  - Classes       │
+│  D B M │                              │  - Labels        │
+│  H ... │                              │  - Images 목록   │
+└────────┴──────────────────────────────┴─────────────────┘
 ```
+
+- **좌측 툴바**: 도구 선택 (Draw / Brush / 매직완드 / Pan 등)
+- **캔버스**: 이미지와 마스크 오버레이 표시, 그리기 · 편집 영역
+- **우측 패널**: 브러시/마스크 설정과 Classes · Labels · Images 목록
 
 ---
 
 ## 단축키
+
+**도구 선택**
 
 | 키 | 기능 |
 |---|---|
@@ -105,19 +118,35 @@ python run_hylabel.py
 | `B` | Brush 도구 |
 | `M` | AI 매직완드 도구 |
 | `H` | Pan (이동) / 한 번 더 누르면 이전 도구로 복귀 |
+| `Space` (누르는 동안) | 임시 Pan 모드 |
+
+**목록 이동**
+
+| 키 | 기능 |
+|---|---|
+| `Page Up` / `Page Down` | 이전 / 다음 이미지 |
+| `↑` / `↓` | 이전 / 다음 클래스 (Classes 목록) |
+| `←` / `→` | 이전 / 다음 레이블 (Labels 목록) |
+
+**보기**
+
+| 키 | 기능 |
+|---|---|
 | `F` | 이미지 맞춤 (Fit) |
-| `=` | 확대 |
-| `-` | 축소 |
-| `[` | 브러시 크기 줄이기 / 매직완드 마스크 선택 |
-| `]` | 브러시 크기 키우기 / 매직완드 마스크 선택 |
+| `=` / `-` | 확대 / 축소 |
+| `V` | 레이블 흐리게 보기 토글 |
+| `G` | 감마 보정 토글 |
+
+**작업**
+
+| 키 | 기능 |
+|---|---|
+| `[` / `]` | 브러시 크기 조절 / 매직완드 마스크 후보 선택 |
 | `Enter` | 마스크 확정 |
 | `Esc` | 취소 / 편집 모드 종료 |
 | `Ctrl+Z` | 실행 취소 |
 | `Ctrl+S` | 저장 |
 | `Ctrl+O` | 폴더 열기 |
-| `Space` (누르는 동안) | 임시 Pan 모드 |
-| `V` | 레이블 흐리게 보기 토글 |
-| `G` | 감마 보정 토글 |
 
 ---
 
@@ -183,7 +212,7 @@ Labels 패널에서 레이블을 선택한 뒤 `B`를 눌러 기존 마스크를
 
 ### AI 매직완드 도구 (`M`)
 
-EdgeSAM 또는 SAM2 (Hiera-Tiny / Base+ / Large) 모델을 이용한 자동 마스크 생성입니다. 사이드바의 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
+EdgeSAM 또는 SAM2 (Hiera-Large) 모델로 마스크를 자동 생성합니다. 사이드바 **AI Model** 드롭다운에서 모델을 전환할 수 있으며, 선택은 다음 실행에도 유지됩니다.
 
 - **좌클릭**: 포함할 영역 지정 (초록 점)
 - **우클릭**: 제외할 영역 지정 (빨간 점)
@@ -191,7 +220,7 @@ EdgeSAM 또는 SAM2 (Hiera-Tiny / Base+ / Large) 모델을 이용한 자동 마�
 - **Enter**: 마스크 확정
 - **Esc**: 초기화
 
-> 선택한 모델의 가중치(`download_weights.py --model <edgesam|sam2|sam2_base_plus|sam2_large>`)와 `onnxruntime` 패키지가 필요합니다.
+> 선택한 모델의 가중치와 `onnxruntime` 패키지가 필요합니다. 가중치 다운로드는 [설치 4단계](#4-ai-매직완드-모델-다운로드-선택)를 참고하세요.
 
 ---
 
