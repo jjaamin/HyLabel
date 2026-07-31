@@ -484,16 +484,29 @@ class MainWindow(QMainWindow):
         self._act_brush_dec = QAction(self, shortcut="[")
         self._act_brush_inc = QAction(self, shortcut="]")
         self._act_pan_toggle = QAction(self, shortcut="H")
+        self._act_img_prev = QAction(self, shortcut="PgUp")
+        self._act_img_next = QAction(self, shortcut="PgDown")
+        self._act_class_prev = QAction(self, shortcut="Up")
+        self._act_class_next = QAction(self, shortcut="Down")
+        self._act_label_prev = QAction(self, shortcut="Left")
+        self._act_label_next = QAction(self, shortcut="Right")
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
         self.addAction(self._act_pan_toggle)
+        self.addAction(self._act_img_prev)
+        self.addAction(self._act_img_next)
+        self.addAction(self._act_class_prev)
+        self.addAction(self._act_class_next)
+        self.addAction(self._act_label_prev)
+        self.addAction(self._act_label_next)
 
         # Status bar
         sb = QStatusBar(self)
         self.setStatusBar(sb)
         self._lbl_mode   = QLabel("Mode: Idle")
         self._lbl_status = QLabel(
-            "H=pan  D=draw  B=brush(LMB=paint/RMB=erase)  Enter=commit  Esc=cancel  [/]=brush size"
+            "H=pan  D=draw  B=brush(LMB=paint/RMB=erase)  Enter=commit  Esc=cancel  [/]=brush size  "
+            "PgUp/PgDn=image  ↑/↓=class  ←/→=label"
         )
         sb.addWidget(self._lbl_mode)
         sb.addPermanentWidget(self._lbl_status)
@@ -521,6 +534,12 @@ class MainWindow(QMainWindow):
         self._act_brush_dec.triggered.connect(lambda: self._adjust_size(-1))
         self._act_brush_inc.triggered.connect(lambda: self._adjust_size(+1))
         self._act_pan_toggle.triggered.connect(self._toggle_pan)
+        self._act_img_prev.triggered.connect(lambda: self._step_list(self._img_list, -1))
+        self._act_img_next.triggered.connect(lambda: self._step_list(self._img_list, +1))
+        self._act_class_prev.triggered.connect(lambda: self._step_list(self._class_list, -1))
+        self._act_class_next.triggered.connect(lambda: self._step_list(self._class_list, +1))
+        self._act_label_prev.triggered.connect(lambda: self._step_list(self._label_list, -1))
+        self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
 
@@ -873,6 +892,15 @@ class MainWindow(QMainWindow):
             a.blockSignals(True)
             a.setChecked(False)
             a.blockSignals(False)
+
+    @staticmethod
+    def _step_list(list_widget: QListWidget, delta: int) -> None:
+        count = list_widget.count()
+        if count == 0:
+            return
+        row = max(0, min(count - 1, list_widget.currentRow() + delta))
+        if row != list_widget.currentRow():
+            list_widget.setCurrentRow(row)
 
     # ── brush size ────────────────────────────────────────────────────────────
 
