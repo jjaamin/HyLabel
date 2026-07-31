@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap,
+    QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 from PyQt6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
@@ -70,6 +70,95 @@ class _MaskOverlayItem(QGraphicsItem):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Control-point dots
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _PointsItem(QGraphicsItem):
+    """Draws every control-point dot of a contour set in ONE scene item.
+
+    One QGraphicsEllipseItem per point does not scale: with CHAIN_APPROX_NONE a
+    single annotation carries thousands of points, and each item flagged
+    ItemIgnoresTransformations forces the view to recompute its transform on
+    every pan/zoom. Here the dots are kept as plain coordinates and painted in a
+    single pass, sized in device pixels so they stay constant on screen.
+    """
+
+    def __init__(self, radius_px: float, color: QColor, z: int) -> None:
+        super().__init__()
+        self._contours: List[List[Tuple[float, float]]] = []
+        self._polys: List[QPolygonF] = []      # cached, rebuilt only on change
+        self._brects: List[QRectF] = []        # per-contour bounds, for culling
+        self._radius_px = radius_px
+        self._color = color
+        self._rect = QRectF()
+        self.setZValue(z)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    # ── data ──────────────────────────────────────────────────────────────
+    def set_contours(self, contours: List[List[Tuple[float, float]]]) -> None:
+        self._contours = contours
+        self._rebuild()
+
+    def clear(self) -> None:
+        self._contours = []
+        self._rebuild()
+
+    def move_point(self, ci: int, pi: int, x: float, y: float) -> None:
+        self._contours[ci][pi] = (x, y)
+        if ci < len(self._polys):
+            self._polys[ci][pi] = QPointF(x, y)
+        self.update()
+
+    def _rebuild(self) -> None:
+        self.prepareGeometryChange()
+        self._polys = []
+        self._brects = []
+        for c in self._contours:
+            poly = QPolygonF([QPointF(x, y) for x, y in c])
+            self._polys.append(poly)
+            self._brects.append(poly.boundingRect())
+        if self._brects:
+            union = self._brects[0]
+            for br in self._brects[1:]:
+                union = union.united(br)
+            # Pad generously: dot radius is in screen px, so its scene-space
+            # extent grows without bound as the view zooms out.
+            self._rect = union.adjusted(-32.0, -32.0, 32.0, 32.0)
+        else:
+            self._rect = QRectF()
+        self.update()
+
+    # ── style ─────────────────────────────────────────────────────────────
+    def set_style(self, radius_px: float, color: QColor) -> None:
+        self._radius_px = radius_px
+        self._color = color
+        self.update()
+
+    # ── painting ──────────────────────────────────────────────────────────
+    def boundingRect(self) -> QRectF:
+        return self._rect
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        if not self._polys:
+            return
+        # A round-capped cosmetic pen draws each point as a dot whose diameter
+        # is the pen width in *device* pixels — constant on screen, and the
+        # whole contour goes out in one C++ call. Iterating points in Python to
+        # drawEllipse() each one costs ~5us apiece, which at full contour
+        # density is tens of ms per frame.
+        pen = QPen(self._color, self._radius_px * 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        scale = abs(painter.transform().m11()) or 1.0
+        pad = self._radius_px / scale
+        exposed = option.exposedRect.adjusted(-pad, -pad, pad, pad)
+        for poly, brect in zip(self._polys, self._brects):
+            if exposed.intersects(brect):
+                painter.drawPoints(poly)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Canvas
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -121,10 +210,11 @@ class ImageCanvas(QGraphicsView):
         # contour / control points
         self._contour_overlay: Optional[_MaskOverlayItem] = None  # pixel boundary
         self._cp_contours: List[List[Tuple[float, float]]] = []
+        self._cp_arrays: List[np.ndarray] = []   # same data, (n,2) float for hit-test
         self._cp_path_items: List[QGraphicsPathItem] = []   # drag preview only
-        self._cp_dot_items: List[List[QGraphicsEllipseItem]] = []
+        self._cp_dots: Optional[_PointsItem] = None
         self._dragging_cp: Tuple[int, int] = (-1, -1)
-        self._class_dot_items: List[QGraphicsEllipseItem] = []  # read-only class overview
+        self._class_dots: Optional[_PointsItem] = None  # read-only class overview
 
         self._mode = Mode.IDLE
         self._active_cat_id: int = -1
@@ -212,8 +302,13 @@ class ImageCanvas(QGraphicsView):
     def restore_pending_mask(self, mask: np.ndarray) -> None:
         """Restore pending mask from an undo snapshot."""
         if self._pending_mask is not None:
+            # Both the pixels being removed and those being added must be
+            # repainted, so refresh the union of the two extents.
+            rect = MaskManager.union_bbox(
+                MaskManager.compute_bbox(self._pending_mask),
+                MaskManager.compute_bbox(mask))
             self._pending_mask[:] = mask
-            self._refresh_overlay_full()
+            self._refresh_overlay_rect(rect)
 
     def refresh_edit_contour(self) -> None:
         """Refresh control-point dots after an external mask change (undo)."""
@@ -290,8 +385,13 @@ class ImageCanvas(QGraphicsView):
         self._cat_colors = cat_colors
         self._refresh_overlay_full()
 
-    def refresh_overlay(self) -> None:
-        self._refresh_overlay_full()
+    def refresh_overlay(self, rect: Optional[Tuple[int, int, int, int]] = None) -> None:
+        """Repaint the mask overlay. Pass the affected (x1,y1,x2,y2) when known —
+        omitting it forces a full-image composite, which is far more expensive."""
+        if rect is None:
+            self._refresh_overlay_full()
+        else:
+            self._refresh_overlay_rect(rect)
 
     def set_active_category(self, cat_id: int) -> None:
         self._active_cat_id = cat_id
@@ -311,22 +411,8 @@ class ImageCanvas(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self._apply_cursor()
         # Update control point dot appearance on mode change
-        if self._edit_ann_id >= 0 and self._cp_dot_items:
-            if mode == Mode.BRUSH:
-                p = QPen(QColor(255, 255, 0, 110), 1.0)
-                p.setCosmetic(True)
-                b = QBrush(QColor(0, 255, 255, 50))
-                r = 4
-            else:
-                p = QPen(QColor("#FFFF00"), 1.5)
-                p.setCosmetic(True)
-                b = QBrush(QColor("#FFFF00"))
-                r = 3
-            for dots in self._cp_dot_items:
-                for dot in dots:
-                    dot.setPen(p)
-                    dot.setBrush(b)
-                    dot.setRect(-r, -r, r * 2, r * 2)
+        if self._edit_ann_id >= 0 and self._cp_dots is not None:
+            self._cp_dots.set_style(*self._cp_dot_style())
         self.mode_changed.emit(mode.name.lower())
 
     def set_brush_size(self, size: int) -> None:
@@ -400,6 +486,7 @@ class ImageCanvas(QGraphicsView):
                         "type": "edit_stroke",
                         "ann_id": self._edit_ann_id,
                         "mask": self._edit_mask.copy(),
+                        "polygons": self._edit_polygons_snapshot(),
                     })
                 self._dragging_cp = (ci, pi)
                 # Switch to drag-preview polygon; hide pixel boundary
@@ -490,6 +577,9 @@ class ImageCanvas(QGraphicsView):
                     Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
                 self._painting = False
                 if self._edit_ann_id >= 0:
+                    if self._mask_manager is not None:
+                        # Settle the bbox after a stroke that may have erased.
+                        self._mask_manager.recompute_bbox(self._edit_ann_id)
                     self._show_contour()  # refresh contour after brush stroke
                 self.stroke_finished.emit()
             return
@@ -568,23 +658,41 @@ class ImageCanvas(QGraphicsView):
 
     # ── contour / control points ──────────────────────────────────────────────
 
+    def _edit_contour_source(self) -> List[List[Tuple[float, float]]]:
+        """Control points to expose for dragging.
+
+        Prefer the annotation's own polygon. Those are the authored
+        coordinates, and moving one vertex must leave every other vertex
+        bit-identical when saved — re-deriving them from the mask would replace
+        the whole outline with a pixel staircase (a 20-point hand-drawn polygon
+        comes back as ~300 points, none of them the originals).
+
+        Fall back to the mask only when there is no polygon to preserve, i.e.
+        after a brush or magic-wand edit, which sets original_polygons to None.
+        """
+        if self._mask_manager is not None and self._edit_ann_id >= 0:
+            ann = self._mask_manager.get_annotation(self._edit_ann_id)
+            if ann is not None and ann.original_polygons:
+                polys = [[(float(x), float(y)) for x, y in poly]
+                         for poly in ann.original_polygons if len(poly) >= 3]
+                if polys:
+                    return polys
+        return MaskManager.extract_cp_contours(self._edit_mask)
+
     def _show_contour(self) -> None:
         """Pixel-perfect boundary overlay + draggable control point dots."""
         self._clear_contour()
         if self._edit_mask is None or self._contour_overlay is None:
             return
 
-        contours = MaskManager.extract_cp_contours(self._edit_mask)
+        contours = self._edit_contour_source()
         if not contours:
             return
         self._cp_contours = contours
+        self._cp_arrays = [np.asarray(c, dtype=np.float64) for c in contours]
 
-        dot_pen = QPen(QColor("#FFFF00"), 1.5)
-        dot_pen.setCosmetic(True)
-        dot_brush = QBrush(QColor("#FFFF00"))
         drag_pen = QPen(QColor("#FFFF00"), 1, Qt.PenStyle.DashLine)
         drag_pen.setCosmetic(True)
-        CP_R = 3
 
         for cp_pts in contours:
             # Drag-preview polygon — hidden until a point is dragged
@@ -599,37 +707,29 @@ class ImageCanvas(QGraphicsView):
             path_item.setVisible(False)
             self._cp_path_items.append(path_item)
 
-            # Control point dots at pixel centres (cp_pts already have +0.5)
-            dots: List[QGraphicsEllipseItem] = []
-            if self._mode == Mode.BRUSH:
-                act_pen = QPen(QColor(255, 255, 0, 110), 1.0)
-                act_pen.setCosmetic(True)
-                act_brush = QBrush(QColor(0, 255, 255, 50))
-                act_r = 4
-            else:
-                act_pen, act_brush, act_r = dot_pen, dot_brush, CP_R
-            for x, y in cp_pts:
-                dot = QGraphicsEllipseItem(-act_r, -act_r, act_r * 2, act_r * 2)
-                dot.setPen(act_pen)
-                dot.setBrush(act_brush)
-                dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-                dot.setPos(x, y)
-                dot.setZValue(35)
-                self.scene().addItem(dot)
-                dots.append(dot)
-            self._cp_dot_items.append(dots)
+        # Control point dots at pixel centres (cp_pts already have +0.5)
+        r, color = self._cp_dot_style()
+        self._cp_dots = _PointsItem(r, color, z=35)
+        self.scene().addItem(self._cp_dots)
+        self._cp_dots.set_contours(contours)
+
+    def _cp_dot_style(self) -> Tuple[float, QColor]:
+        """Dot appearance — dimmer and larger while the brush is active."""
+        if self._mode == Mode.BRUSH:
+            return 4.0, QColor(255, 255, 0, 110)
+        return 3.0, QColor("#FFFF00")
 
     def _clear_contour(self) -> None:
         if self._contour_overlay is not None:
             self._contour_overlay.clear()
         for item in self._cp_path_items:
             self.scene().removeItem(item)
-        for dots in self._cp_dot_items:
-            for dot in dots:
-                self.scene().removeItem(dot)
+        if self._cp_dots is not None:
+            self.scene().removeItem(self._cp_dots)
+            self._cp_dots = None
         self._cp_path_items = []
-        self._cp_dot_items = []
         self._cp_contours = []
+        self._cp_arrays = []
         self._dragging_cp = (-1, -1)
 
     def show_class_contours(self, masks: List[np.ndarray]) -> None:
@@ -637,33 +737,46 @@ class ImageCanvas(QGraphicsView):
         self.clear_class_contours()
         if not self._pixmap_item:
             return
-        pen = QPen(QColor(255, 255, 255, 220), 1.2)
-        pen.setCosmetic(True)
-        r = 3
+        contours: List[List[Tuple[float, float]]] = []
         for mask in masks:
-            for cp_pts in MaskManager.extract_cp_contours(mask):
-                for x, y in cp_pts:
-                    dot = QGraphicsEllipseItem(-r, -r, r * 2, r * 2)
-                    dot.setPen(pen)
-                    dot.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-                    dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-                    dot.setPos(x, y)
-                    dot.setZValue(30)
-                    self.scene().addItem(dot)
-                    self._class_dot_items.append(dot)
+            contours.extend(MaskManager.extract_cp_contours(mask))
+        if not contours:
+            return
+        self._class_dots = _PointsItem(3.0, QColor(255, 255, 255, 220), z=30)
+        self.scene().addItem(self._class_dots)
+        self._class_dots.set_contours(contours)
 
     def clear_class_contours(self) -> None:
-        for dot in self._class_dot_items:
-            self.scene().removeItem(dot)
-        self._class_dot_items = []
+        if self._class_dots is not None:
+            self.scene().removeItem(self._class_dots)
+            self._class_dots = None
 
     def _find_control_point(self, sp: QPointF) -> Tuple[int, int]:
-        """Return (contour_idx, point_idx) of nearest control point within CP_SNAP, or (-1,-1)."""
-        for ci, pts in enumerate(self._cp_contours):
-            for pi, (x, y) in enumerate(pts):
-                if self._view_dist(sp, QPointF(x, y)) < CP_SNAP:
-                    return (ci, pi)
-        return (-1, -1)
+        """Return (contour_idx, point_idx) of nearest control point within
+        CP_SNAP, or (-1,-1).
+
+        Runs on every mouse move, so it compares in scene space with numpy
+        instead of calling mapFromScene() per point — with full-density contours
+        that was two Qt calls per point per move.
+        """
+        if not self._cp_arrays:
+            return (-1, -1)
+        scale = abs(self.transform().m11()) or 1.0
+        snap2 = (CP_SNAP / scale) ** 2      # view px → scene units
+        sx, sy = sp.x(), sp.y()
+        best = (-1, -1)
+        best_d2 = snap2
+        for ci, arr in enumerate(self._cp_arrays):
+            if arr.size == 0:
+                continue
+            dx = arr[:, 0] - sx
+            dy = arr[:, 1] - sy
+            d2 = dx * dx + dy * dy
+            pi = int(np.argmin(d2))
+            if d2[pi] < best_d2:
+                best_d2 = float(d2[pi])
+                best = (ci, pi)
+        return best
 
     def _move_control_point(self, ci: int, pi: int, sp: QPointF) -> None:
         if not self._mask_manager:
@@ -671,6 +784,8 @@ class ImageCanvas(QGraphicsView):
         x = max(0.5, min(float(sp.x()), float(self._mask_manager.width  - 1) + 0.5))
         y = max(0.5, min(float(sp.y()), float(self._mask_manager.height - 1) + 0.5))
         self._cp_contours[ci][pi] = (x, y)
+        self._cp_arrays[ci][pi, 0] = x
+        self._cp_arrays[ci][pi, 1] = y
 
         # Update drag-preview polygon
         pts = self._cp_contours[ci]
@@ -681,17 +796,29 @@ class ImageCanvas(QGraphicsView):
         path.closeSubpath()
         self._cp_path_items[ci].setPath(path)
 
-        self._cp_dot_items[ci][pi].setPos(x, y)
+        if self._cp_dots is not None:
+            self._cp_dots.move_point(ci, pi, x, y)
 
     def _commit_contour_edit(self) -> None:
         """Re-rasterize all edited contours into the annotation mask."""
         if self._edit_mask is None:
             return
+        old_rect = None
+        if self._mask_manager is not None:
+            prev = self._mask_manager.get_annotation(self._edit_ann_id)
+            if prev is not None:
+                old_rect = prev.bbox
         self._edit_mask[:] = 0
         for pts in self._cp_contours:
             if len(pts) >= 3:
                 MaskManager.fill_polygon_on(self._edit_mask, pts)
-        self._refresh_overlay_full()
+        if self._mask_manager is not None:
+            # Mask was rebuilt from scratch — bbox must be recomputed before
+            # any render, or culling would use the pre-edit extent.
+            self._mask_manager.recompute_bbox(self._edit_ann_id)
+            ann = self._mask_manager.get_annotation(self._edit_ann_id)
+            self._refresh_overlay_rect(MaskManager.union_bbox(
+                old_rect, ann.bbox if ann is not None else None))
         # Preserve edited contour points as polygon — no simplification on save
         if self._mask_manager is not None:
             ann = self._mask_manager.get_annotation(self._edit_ann_id)
@@ -719,6 +846,20 @@ class ImageCanvas(QGraphicsView):
             self._cat_colors, self._pending_mask, self._active_cat_id)
         self._overlay_item.fill_all(rgba)
 
+    def _refresh_overlay_rect(self,
+                              rect: Optional[Tuple[int, int, int, int]]) -> None:
+        """Refresh a single region, clamped to the image. None is a no-op."""
+        if rect is None or not self._mask_manager or not self._overlay_item:
+            return
+        x1, y1, x2, y2 = rect
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(self._mask_manager.width, x2)
+        y2 = min(self._mask_manager.height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+        self._refresh_overlay_region(x1, y1, x2, y2)
+
     # ── pending mask ──────────────────────────────────────────────────────────
 
     def _commit_pending(self) -> None:
@@ -726,6 +867,7 @@ class ImageCanvas(QGraphicsView):
             return
         if self._mask_manager is None or self._active_cat_id < 0:
             return
+        rect = MaskManager.compute_bbox(self._pending_mask)
         ann_id = self._mask_manager.add_annotation(self._active_cat_id, self._pending_mask)
         if self._pending_polygons is not None:
             ann = self._mask_manager.get_annotation(ann_id)
@@ -733,14 +875,29 @@ class ImageCanvas(QGraphicsView):
                 ann.original_polygons = self._pending_polygons
             self._pending_polygons = None
         self._pending_mask[:] = 0
-        self._refresh_overlay_full()
+        self._refresh_overlay_rect(rect)
         self.annotation_committed.emit(ann_id)
 
     def _discard_pending(self) -> None:
         self._pending_polygons = None
         if self._pending_mask is not None and self._pending_mask.any():
+            rect = MaskManager.compute_bbox(self._pending_mask)
             self._pending_mask[:] = 0
-            self._refresh_overlay_full()
+            self._refresh_overlay_rect(rect)
+
+    def _edit_polygons_snapshot(self) -> Optional[List]:
+        """Deep copy of the edited annotation's polygon, for the undo stack.
+
+        The mask alone is not enough to undo an edit: original_polygons is what
+        gets written on save, so restoring one without the other would leave the
+        saved coordinates reflecting an edit the user already undid.
+        """
+        if self._mask_manager is None or self._edit_ann_id < 0:
+            return None
+        ann = self._mask_manager.get_annotation(self._edit_ann_id)
+        if ann is None or ann.original_polygons is None:
+            return None
+        return [[[x, y] for x, y in poly] for poly in ann.original_polygons]
 
     def _save_brush_undo(self) -> None:
         """Emit a snapshot of the current mask state before a brush stroke begins."""
@@ -749,6 +906,7 @@ class ImageCanvas(QGraphicsView):
                 "type": "edit_stroke",
                 "ann_id": self._edit_ann_id,
                 "mask": self._edit_mask.copy(),
+                "polygons": self._edit_polygons_snapshot(),
             })
         elif self._pending_mask is not None:
             self.undo_record.emit({
@@ -827,8 +985,13 @@ class ImageCanvas(QGraphicsView):
             # Edit mode: write directly to the existing annotation's mask
             if not self._stroke_erase:
                 x1, y1, x2, y2 = MaskManager.paint_circle_on(self._edit_mask, ix, iy, r)
+                # Painting can extend the mask — bbox must grow with it or the
+                # new pixels would be culled from rendering.
+                self._mask_manager.grow_bbox(self._edit_ann_id, (x1, y1, x2, y2))
             else:
                 x1, y1, x2, y2 = MaskManager.erase_circle_on(self._edit_mask, ix, iy, r)
+                # Erasing can only shrink the true extent; a stale-larger bbox
+                # is harmless, so recompute once at stroke end instead.
             if x2 > x1 and y2 > y1:
                 rgba = self._mask_manager.rgba_region(x1, y1, x2, y2, self._cat_colors)
                 self._overlay_item.refresh_region(rgba, x1, y1)
@@ -913,9 +1076,11 @@ class ImageCanvas(QGraphicsView):
         if self._magic_masks is None or self._pending_mask is None:
             return
         mask = self._magic_masks[self._magic_mask_idx]
+        old = MaskManager.compute_bbox(self._pending_mask)
         self._pending_mask[:] = 0
         self._pending_mask[mask > 0] = 255
-        self._refresh_overlay_full()
+        new = MaskManager.compute_bbox(self._pending_mask)
+        self._refresh_overlay_rect(MaskManager.union_bbox(old, new))
 
     def clear_magic(self, keep_pending: bool = False) -> None:
         self._magic_pts = []

@@ -13,6 +13,14 @@ class Annotation:
     # Original polygon points loaded from LabelMe [[x,y], ...].
     # Preserved on save unless the mask was edited (then set to None).
     original_polygons: Optional[List] = field(default=None, repr=False, compare=False)
+    # Tight bounds of the set pixels as (x1, y1, x2, y2), x2/y2 exclusive.
+    # None means the mask is empty. Used to cull work in rgba_region().
+    #
+    # INVARIANT: bbox must never be smaller than the true extent, or those
+    # pixels stop rendering. A too-large bbox only costs a little extra work,
+    # so growing on paint and recomputing on shrink is always safe.
+    bbox: Optional[Tuple[int, int, int, int]] = field(
+        default=None, repr=False, compare=False)
 
 
 class MaskManager:
@@ -30,13 +38,62 @@ class MaskManager:
         self._annotations: List[Annotation] = []
         self._next_id: int = 1
 
+    # ── bbox helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def compute_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Tight (x1, y1, x2, y2) of set pixels, x2/y2 exclusive. None if empty."""
+        rows = np.any(mask, axis=1)
+        if not rows.any():
+            return None
+        cols = np.any(mask, axis=0)
+        y1 = int(np.argmax(rows))
+        y2 = int(len(rows) - np.argmax(rows[::-1]))
+        x1 = int(np.argmax(cols))
+        x2 = int(len(cols) - np.argmax(cols[::-1]))
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def union_bbox(a: Optional[Tuple[int, int, int, int]],
+                   b: Optional[Tuple[int, int, int, int]]
+                   ) -> Optional[Tuple[int, int, int, int]]:
+        """Smallest rect covering both, ignoring None operands."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return (min(a[0], b[0]), min(a[1], b[1]),
+                max(a[2], b[2]), max(a[3], b[3]))
+
+    def recompute_bbox(self, ann_id: int) -> None:
+        """Full recompute — call after an edit that may have shrunk the mask."""
+        ann = self.get_annotation(ann_id)
+        if ann is not None:
+            ann.bbox = self.compute_bbox(ann.mask)
+
+    def grow_bbox(self, ann_id: int, rect: Tuple[int, int, int, int]) -> None:
+        """Union rect into the annotation bbox — call after painting into it."""
+        ann = self.get_annotation(ann_id)
+        if ann is None:
+            return
+        x1, y1, x2, y2 = rect
+        if x2 <= x1 or y2 <= y1:
+            return
+        if ann.bbox is None:
+            ann.bbox = (x1, y1, x2, y2)
+        else:
+            bx1, by1, bx2, by2 = ann.bbox
+            ann.bbox = (min(bx1, x1), min(by1, y1), max(bx2, x2), max(by2, y2))
+
     # ── annotation management ─────────────────────────────────────────────────
 
     def add_annotation(self, cat_id: int, mask: np.ndarray) -> int:
         """Commit a mask as a new annotation. Returns the new ann_id."""
         ann_id = self._next_id
         self._next_id += 1
-        self._annotations.append(Annotation(ann_id, cat_id, mask.copy()))
+        m = mask.copy()
+        self._annotations.append(
+            Annotation(ann_id, cat_id, m, bbox=self.compute_bbox(m)))
         return ann_id
 
     def remove_annotation(self, ann_id: int) -> None:
@@ -55,10 +112,17 @@ class MaskManager:
         return -1
 
     def restore_annotation(self, ann_id: int, cat_id: int,
-                           mask: np.ndarray, index: Optional[int] = None) -> None:
-        """Re-insert a previously removed annotation at its original position."""
+                           mask: np.ndarray, index: Optional[int] = None,
+                           original_polygons: Optional[List] = None) -> None:
+        """Re-insert a previously removed annotation at its original position.
+
+        original_polygons must be passed back too — dropping it would silently
+        downgrade an authored polygon to a mask-extracted outline on save.
+        """
         self._annotations = [a for a in self._annotations if a.ann_id != ann_id]
-        ann = Annotation(ann_id, cat_id, mask.copy())
+        m = mask.copy()
+        ann = Annotation(ann_id, cat_id, m, original_polygons=original_polygons,
+                         bbox=self.compute_bbox(m))
         if index is not None:
             idx = min(index, len(self._annotations))
             self._annotations.insert(idx, ann)
@@ -127,6 +191,15 @@ class MaskManager:
 
     # ── overlay rendering ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _blend_into(acc: np.ndarray, count: np.ndarray, hit: np.ndarray,
+                    r: int, g: int, b: int) -> None:
+        """Accumulate one colour into acc/count wherever hit is True, in place."""
+        np.add(acc[:, :, 0], r, out=acc[:, :, 0], where=hit)
+        np.add(acc[:, :, 1], g, out=acc[:, :, 1], where=hit)
+        np.add(acc[:, :, 2], b, out=acc[:, :, 2], where=hit)
+        np.add(count, 1, out=count, where=hit)
+
     def rgba_region(self, x1: int, y1: int, x2: int, y2: int,
                     cat_colors: Dict[int, Tuple[int, int, int]],
                     pending_mask: Optional[np.ndarray] = None,
@@ -137,23 +210,35 @@ class MaskManager:
         count = np.zeros((h, w), dtype=np.uint8)
 
         for ann in self._annotations:
-            region = ann.mask[y1:y2, x1:x2]
-            if not region.any():
+            bb = ann.bbox
+            if bb is None:
                 continue
-            hit = region > 0
+            bx1, by1, bx2, by2 = bb
+            # Reject annotations whose bounds miss the requested region entirely.
+            # This is what keeps the cost proportional to what is actually
+            # visible rather than to (annotation count × image area).
+            if bx2 <= x1 or bx1 >= x2 or by2 <= y1 or by1 >= y2:
+                continue
+            # Work only on the intersection of the bbox and the region.
+            ix1, iy1 = max(x1, bx1), max(y1, by1)
+            ix2, iy2 = min(x2, bx2), min(y2, by2)
+
+            hit = ann.mask[iy1:iy2, ix1:ix2] > 0
+            if not hit.any():
+                continue
             r, g, b = cat_colors.get(ann.cat_id, (255, 0, 0))
-            acc[hit, 0] += r
-            acc[hit, 1] += g
-            acc[hit, 2] += b
-            count[hit] += 1
+            # Views into acc/count — np.add(where=) writes through in place.
+            # This is ~3x faster than boolean fancy indexing (`a[hit] += r`),
+            # which allocates a gather buffer on every call.
+            sub_acc = acc[iy1 - y1:iy2 - y1, ix1 - x1:ix2 - x1]
+            self._blend_into(sub_acc,
+                             count[iy1 - y1:iy2 - y1, ix1 - x1:ix2 - x1],
+                             hit, r, g, b)
 
         if pending_mask is not None and pending_cat_id >= 0 and pending_mask.any():
             hit = pending_mask > 0
             r, g, b = cat_colors.get(pending_cat_id, (255, 0, 0))
-            acc[hit, 0] += r
-            acc[hit, 1] += g
-            acc[hit, 2] += b
-            count[hit] += 1
+            self._blend_into(acc, count, hit, r, g, b)
 
         out = np.zeros((h, w, 4), dtype=np.uint8)
         any_hit = count > 0
@@ -184,9 +269,16 @@ class MaskManager:
 
     @staticmethod
     def extract_cp_contours(mask: np.ndarray) -> List[List[Tuple[float, float]]]:
-        """TC89_L1 contour points at pixel centres (+0.5) for control-point dragging."""
+        """Full-density contour points at pixel centres (+0.5) for control-point
+        dragging.
+
+        CHAIN_APPROX_NONE is mandatory here: these points are not display-only —
+        _commit_contour_edit() re-rasterizes the mask from them and writes them
+        to Annotation.original_polygons. Any approximation (TC89_L1, approxPolyDP)
+        would silently discard boundary detail on every edit.
+        """
         contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         result = []
         for c in contours:
             if len(c) < 3:
@@ -231,4 +323,6 @@ class MaskManager:
             if mask.any():
                 ann_id = ann.get("id", self._next_id)
                 self._next_id = max(self._next_id, ann_id + 1)
-                self._annotations.append(Annotation(ann_id, cat_id, mask))
+                self._annotations.append(
+                    Annotation(ann_id, cat_id, mask,
+                               bbox=self.compute_bbox(mask)))

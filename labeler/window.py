@@ -826,6 +826,7 @@ class MainWindow(QMainWindow):
         if mgr is None:
             return
         ann = mgr.get_annotation(ann_id)
+        rect = ann.bbox if ann is not None else None
         if ann is not None:
             self._push_undo({
                 "type": "ann_deleted",
@@ -833,10 +834,13 @@ class MainWindow(QMainWindow):
                 "cat_id": ann.cat_id,
                 "mask": ann.mask.copy(),
                 "index": mgr.annotation_index(ann_id),
+                "polygons": (
+                    [[[x, y] for x, y in p] for p in ann.original_polygons]
+                    if ann.original_polygons is not None else None),
             })
         self.canvas.clear_edit_annotation()
         mgr.remove_annotation(ann_id)
-        self.canvas.refresh_overlay()
+        self.canvas.refresh_overlay(rect)
         self._refresh_labels()
         self._mark_modified()
         self._show_class_contours()
@@ -1061,8 +1065,15 @@ class MainWindow(QMainWindow):
                 return
             ann = mgr.get_annotation(ann_id)
             if ann is not None:
+                old = ann.bbox
                 ann.mask[:] = record["mask"]
-                self.canvas.refresh_overlay()
+                # Restore the polygon alongside the mask — original_polygons is
+                # what gets saved, so undoing one without the other would leave
+                # the JSON reflecting an edit the user just undid.
+                ann.original_polygons = record.get("polygons")
+                mgr.recompute_bbox(ann_id)   # mask replaced wholesale
+                self.canvas.refresh_overlay(
+                    MaskManager.union_bbox(old, ann.bbox))
                 self.canvas.refresh_edit_contour()
             self._mark_modified()
 
@@ -1073,9 +1084,11 @@ class MainWindow(QMainWindow):
             mgr = self._mask_managers.get(self.current_img_ann.image_id)
             if mgr is None:
                 return
+            ann = mgr.get_annotation(ann_id)
+            rect = ann.bbox if ann is not None else None
             self.canvas.clear_edit_annotation()
             mgr.remove_annotation(ann_id)
-            self.canvas.refresh_overlay()
+            self.canvas.refresh_overlay(rect)
             self._refresh_labels()
             self._mark_modified()
 
@@ -1088,8 +1101,11 @@ class MainWindow(QMainWindow):
             mgr.restore_annotation(
                 record["ann_id"], record["cat_id"],
                 record["mask"], record.get("index"),
+                record.get("polygons"),
             )
-            self.canvas.refresh_overlay()
+            restored = mgr.get_annotation(record["ann_id"])
+            self.canvas.refresh_overlay(
+                restored.bbox if restored is not None else None)
             self._refresh_labels()
             self._mark_modified()
 
