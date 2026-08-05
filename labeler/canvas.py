@@ -22,7 +22,7 @@ CP_SNAP   = 12      # view-space pixels for control-point grab
 # normal labelling view; the rest fade the overlay so the image underneath can
 # be checked, one step stronger and one step weaker than the single faint
 # setting this replaced (0.22).
-FAINT_LEVELS = (0.8, 0.30, 0.12)
+FAINT_LEVELS = (0.8, 0.30, 0.08)
 
 
 class Mode(Enum):
