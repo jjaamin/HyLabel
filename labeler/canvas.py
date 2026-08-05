@@ -18,6 +18,12 @@ from .mask_manager import MaskManager
 SNAP_DIST = 14      # view-space pixels for polygon first-point snap
 CP_SNAP   = 12      # view-space pixels for control-point grab
 
+# Mask overlay opacity per faint level, cycled by the V key. Level 0 is the
+# normal labelling view; the rest fade the overlay so the image underneath can
+# be checked, one step stronger and one step weaker than the single faint
+# setting this replaced (0.22).
+FAINT_LEVELS = (0.8, 0.30, 0.12)
+
 
 class Mode(Enum):
     IDLE  = auto()
@@ -240,16 +246,22 @@ class ImageCanvas(QGraphicsView):
         self._original_pixmap: Optional[QPixmap] = None
         self._gamma_lut: Optional[np.ndarray] = None
         self._gamma_enabled: bool = False
-        self._faint_mode: bool = False
+        self._faint_level: int = 0
 
         self._last_mouse_scene_pos = QPointF(0.0, 0.0)
 
     # ── faint / gamma public API ─────────────────────────────────────────────
 
-    def set_faint_mode(self, faint: bool) -> None:
-        self._faint_mode = faint
+    @property
+    def faint_level(self) -> int:
+        return self._faint_level
+
+    def set_faint_level(self, level: int) -> None:
+        """Select an overlay opacity from FAINT_LEVELS. Wraps, so callers can
+        just pass level + 1 to advance."""
+        self._faint_level = level % len(FAINT_LEVELS)
         if self._overlay_item is not None:
-            self._overlay_item.setOpacity(0.22 if faint else 0.8)
+            self._overlay_item.setOpacity(FAINT_LEVELS[self._faint_level])
 
     def set_gamma_lut(self, lut: np.ndarray) -> None:
         self._gamma_lut = lut
@@ -343,7 +355,7 @@ class ImageCanvas(QGraphicsView):
 
         self._overlay_item = _MaskOverlayItem(w, h)
         scene.addItem(self._overlay_item)
-        self._overlay_item.setOpacity(0.22 if self._faint_mode else 0.8)
+        self._overlay_item.setOpacity(FAINT_LEVELS[self._faint_level])
 
         self._contour_overlay = _MaskOverlayItem(w, h)
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)

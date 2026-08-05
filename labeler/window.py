@@ -1244,8 +1244,18 @@ class MainWindow(QMainWindow):
 
     # ── faint / gamma ─────────────────────────────────────────────────────────
 
+    _FAINT_NAMES = ("원본", "흐리게", "더 흐리게")
+
     def _toggle_faint(self) -> None:
-        self.canvas.set_faint_mode(self._act_faint.isChecked())
+        """V cycles the overlay opacity 0 → 1 → 2 → 0."""
+        level = (self.canvas.faint_level + 1) % len(self._FAINT_NAMES)
+        self.canvas.set_faint_level(level)
+        # The action is checkable, and Qt has already flipped it by the time we
+        # get here. Re-drive it from the level so the tick means "not original"
+        # rather than tracking its own two-state toggle.
+        self._act_faint.setChecked(level != 0)
+        self._lbl_status.setText(
+            f"레이블 투명도: {self._FAINT_NAMES[level]}  ({level + 1}/3)")
 
     def _toggle_gamma(self) -> None:
         self.canvas.set_gamma_enabled(self._act_gamma.isChecked())
