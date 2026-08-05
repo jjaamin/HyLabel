@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QSize, QSettings, QEvent
+from PyQt6.QtCore import Qt, QSize, QSettings
 from PyQt6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
@@ -490,6 +490,10 @@ class MainWindow(QMainWindow):
         self._act_class_next = QAction(self, shortcut="Down")
         self._act_label_prev = QAction(self, shortcut="Left")
         self._act_label_next = QAction(self, shortcut="Right")
+        # Delete has to be window-level too: selecting a label switches to the
+        # brush tool, which hands focus to the canvas, so a key filter on the
+        # label list never sees the keystroke.
+        self._act_label_del = QAction(self, shortcut="Delete")
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
         self.addAction(self._act_pan_toggle)
@@ -499,6 +503,7 @@ class MainWindow(QMainWindow):
         self.addAction(self._act_class_next)
         self.addAction(self._act_label_prev)
         self.addAction(self._act_label_next)
+        self.addAction(self._act_label_del)
 
         # Status bar
         sb = QStatusBar(self)
@@ -540,6 +545,7 @@ class MainWindow(QMainWindow):
         self._act_class_next.triggered.connect(lambda: self._step_list(self._class_list, +1))
         self._act_label_prev.triggered.connect(lambda: self._step_list(self._label_list, -1))
         self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
+        self._act_label_del.triggered.connect(self._clear_active_label)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
 
@@ -550,7 +556,6 @@ class MainWindow(QMainWindow):
         self._class_list.clicked.connect(self._on_class_clicked)
 
         self._btn_clear_label.clicked.connect(self._clear_active_label)
-        self._label_list.installEventFilter(self)
         self._label_class_combo.currentIndexChanged.connect(self._on_label_class_changed)
 
         self._img_list.currentRowChanged.connect(self._on_image_selected)
@@ -1027,13 +1032,6 @@ class MainWindow(QMainWindow):
         self._show_class_contours()
 
     # ── undo ──────────────────────────────────────────────────────────────────
-
-    def eventFilter(self, obj, event) -> bool:
-        if obj is self._label_list and event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Delete:
-                self._clear_active_label()
-                return True
-        return super().eventFilter(obj, event)
 
     def _push_undo(self, record: dict) -> None:
         self._undo_stack.append(record)
