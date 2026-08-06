@@ -19,11 +19,18 @@ def save_labelme(
     project: Project,
     mask_managers: Dict[int, MaskManager],
     image_dir: str,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> None:
-    """Write one <stem>.json per image into image_dir (LabelMe format)."""
-    cat_map = {c.id: c for c in project.categories}
+    """Write one <stem>.json per image into image_dir (LabelMe format).
 
-    for img in project.images:
+    progress(done, total) reports per image so the caller can show a bar;
+    writing costs roughly 12ms per image, more where a brush-edited mask has to
+    have its contour re-extracted.
+    """
+    cat_map = {c.id: c for c in project.categories}
+    total = max(1, len(project.images))
+
+    for done, img in enumerate(project.images, start=1):
         shapes: list = []
         mgr = mask_managers.get(img.image_id)
 
@@ -66,7 +73,11 @@ def save_labelme(
                         })
 
         if not shapes:
-            continue  # No annotations — don't create an empty JSON file
+            # No annotations — don't create an empty JSON file, but the image
+            # still counts as processed or the bar would stall short.
+            if progress is not None:
+                progress(done, total)
+            continue
 
         img_basename = os.path.basename(img.file_path)
         stem = os.path.splitext(img_basename)[0]
@@ -82,6 +93,9 @@ def save_labelme(
                 "imageHeight": img.height,
                 "imageWidth": img.width,
             }, f, ensure_ascii=False, indent=2)
+
+        if progress is not None:
+            progress(done, total)
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────

@@ -644,7 +644,7 @@ class MainWindow(QMainWindow):
             self._img_list.addItem(f)
 
         if files and coco_io.has_labelme_annotations(folder, files):
-            with self._loading_progress(f"{os.path.basename(folder)} 여는 중…") as tick:
+            with self._progress_dialog(f"{os.path.basename(folder)} 여는 중…") as tick:
                 try:
                     proj, mgrs = coco_io.load_labelme(folder, files, progress=tick)
                     self.project = proj
@@ -660,16 +660,18 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     @contextlib.contextmanager
-    def _loading_progress(self, label: str):
+    def _progress_dialog(self, label: str):
         """Yield a progress(done, total) callback backed by a QProgressDialog.
 
-        Reading a folder's annotations takes about 17ms per image, so a few
-        hundred images is a multi-second freeze with no feedback. The dialog
-        only appears once the work has already run past minimumDuration, which
-        keeps small folders from flashing a box open and shut.
+        Reading and writing a folder's annotations each cost on the order of
+        15ms per image, so a few hundred images is a multi-second freeze with no
+        feedback. The dialog only appears once the work has already run past
+        minimumDuration, which keeps small folders from flashing a box open and
+        shut.
 
-        No cancel button: aborting midway would leave the project half-loaded,
-        and the point here is feedback rather than control.
+        No cancel button: aborting a load midway would leave the project
+        half-read and aborting a save half-written, and the point here is
+        feedback rather than control.
         """
         dlg = QProgressDialog(label, None, 0, 100, self)
         dlg.setWindowTitle("HyLabel")
@@ -724,7 +726,11 @@ class MainWindow(QMainWindow):
 
     def _do_save(self, directory: str) -> None:
         try:
-            coco_io.save_labelme(self.project, self._mask_managers, directory)
+            with self._progress_dialog(
+                f"{os.path.basename(directory)} 에 저장하는 중…"
+            ) as tick:
+                coco_io.save_labelme(self.project, self._mask_managers,
+                                     directory, progress=tick)
             self.save_path = directory
             self._modified = False
             self._update_title()
@@ -745,7 +751,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Images", "Open an image folder first.")
             return
         try:
-            with self._loading_progress(
+            with self._progress_dialog(
                 f"{os.path.basename(directory)} 어노테이션 불러오는 중…"
             ) as tick:
                 proj, mgrs = coco_io.load_labelme(directory, files, progress=tick)
