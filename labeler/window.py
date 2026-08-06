@@ -98,6 +98,36 @@ def _fit_icon(size: int = 21) -> QIcon:
     return QIcon(pm)
 
 
+def _arrow_icon(size: int = 21) -> QIcon:
+    from PyQt6.QtGui import QPainterPath
+
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = float(size)
+
+    # Classic pointer: shaft down the left, notch, then the tail kicking right.
+    path = QPainterPath()
+    path.moveTo(s * 0.24, s * 0.09)
+    path.lineTo(s * 0.24, s * 0.79)
+    path.lineTo(s * 0.41, s * 0.63)
+    path.lineTo(s * 0.53, s * 0.90)
+    path.lineTo(s * 0.66, s * 0.83)
+    path.lineTo(s * 0.54, s * 0.58)
+    path.lineTo(s * 0.76, s * 0.56)
+    path.closeSubpath()
+
+    pen = QPen(QColor("#404040"), max(1.0, s * 0.08))
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(QColor("#f5f5f5"))
+    p.drawPath(path)
+
+    p.end()
+    return QIcon(pm)
+
+
 def _polygon_icon(size: int = 21) -> QIcon:
     import math
     from PyQt6.QtGui import QPainterPath
@@ -333,12 +363,17 @@ class MainWindow(QMainWindow):
         """)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
 
-        # Tool group (exclusive): Draw / Brush / Pan
+        # Tool group (exclusive): Select / Draw / Brush / Magic / Pan
+        self._act_select = QAction(self, shortcut="S", checkable=True)
         self._act_draw  = QAction(self, shortcut="D", checkable=True)
         self._act_brush = QAction(self, shortcut="B", checkable=True)
         self._act_magic = QAction(self, shortcut="M", checkable=True)
         self._act_hand  = QAction(self, checkable=True)
 
+        self._act_select.setIcon(_arrow_icon())
+        self._act_select.setToolTip(
+            "Select  (S)  —  click a label on the canvas to select it"
+        )
         self._act_draw.setIcon(_polygon_icon())
         self._act_draw.setToolTip("Draw Polygon  (D)")
         self._act_brush.setIcon(_text_icon("🖌", size=21))
@@ -358,7 +393,7 @@ class MainWindow(QMainWindow):
 
         tool_group = QActionGroup(self)
         tool_group.setExclusive(True)
-        for a in (self._act_draw, self._act_brush, self._act_magic):
+        for a in (self._act_select, self._act_draw, self._act_brush, self._act_magic):
             tool_group.addAction(a)
             tb.addAction(a)
 
@@ -523,6 +558,7 @@ class MainWindow(QMainWindow):
         self._act_save.triggered.connect(self._save)
         self._act_save_as.triggered.connect(self._save_as)
         self._act_load_ann.triggered.connect(self._load_annotations)
+        self._act_select.toggled.connect(self._on_tool_toggled)
         self._act_hand.toggled.connect(self._on_tool_toggled)
         self._act_draw.toggled.connect(self._on_tool_toggled)
         self._act_brush.toggled.connect(self._on_tool_toggled)
@@ -562,6 +598,7 @@ class MainWindow(QMainWindow):
 
         self.canvas.annotation_committed.connect(self._on_annotation_committed)
         self.canvas.magic_requested.connect(self._on_magic_requested)
+        self.canvas.select_requested.connect(self._on_canvas_select)
         self.canvas.undo_record.connect(self._push_undo)
         self.canvas.edit_changed.connect(self._on_edit_changed)
         self.canvas.edit_cleared.connect(self._on_edit_cleared)
@@ -712,13 +749,13 @@ class MainWindow(QMainWindow):
 
         self.canvas.set_mask_manager(mgr, self._color_tuples())
 
-        # Reset tool buttons to idle
-        self._uncheck_all_tools()
-        self.canvas.set_mode(Mode.IDLE)
+        # Back to the arrow tool for the new image
+        self._activate_select_tool()
 
         self._update_active_class()
         self._refresh_labels()
         self._lbl_status.setText(f"{name}  ({w}×{h})")
+        self._update_title()
 
     # ── class management ──────────────────────────────────────────────────────
 
@@ -865,9 +902,18 @@ class MainWindow(QMainWindow):
     def _on_tool_toggled(self, checked: bool) -> None:
         if not checked:
             return
-        # Hand tool: no category required
-        if self._act_hand.isChecked():
+        # Dispatch on the action that fired, not on isChecked(). The action
+        # group has not finished unchecking the previous tool when this runs, so
+        # polling the others reads a stale True and picks the wrong branch.
+        action = self.sender()
+        # Hand and Select need no category — neither creates an annotation.
+        if action is self._act_hand:
             self.canvas.set_mode(Mode.PAN)
+            self.canvas.setFocus()
+            return
+        if action is self._act_select:
+            self._pre_pan_action = self._act_select
+            self.canvas.set_mode(Mode.SELECT)
             self.canvas.setFocus()
             return
         # Drawing tools: require at least one class
@@ -877,15 +923,15 @@ class MainWindow(QMainWindow):
             )
             self._uncheck_all_tools()
             return
-        if self._act_draw.isChecked():
+        if action is self._act_draw:
             self._pre_pan_action = self._act_draw
             self._update_active_class()
             self.canvas.set_mode(Mode.DRAW)
-        elif self._act_brush.isChecked():
+        elif action is self._act_brush:
             self._pre_pan_action = self._act_brush
             self._update_active_class()
             self.canvas.set_mode(Mode.BRUSH)
-        elif self._act_magic.isChecked():
+        elif action is self._act_magic:
             if self.canvas.is_editing:
                 self.canvas.clear_edit_annotation()
                 self.canvas.set_mode(Mode.IDLE)
@@ -907,10 +953,25 @@ class MainWindow(QMainWindow):
             self._act_hand.setChecked(True)
 
     def _uncheck_all_tools(self) -> None:
-        for a in (self._act_hand, self._act_draw, self._act_brush, self._act_magic):
+        for a in (self._act_select, self._act_hand, self._act_draw,
+                  self._act_brush, self._act_magic):
             a.blockSignals(True)
             a.setChecked(False)
             a.blockSignals(False)
+
+    def _activate_select_tool(self) -> None:
+        """Fall back to the arrow tool — the resting state between actions.
+
+        Checked without blocking signals so the action group registers it as the
+        current tool; otherwise the group keeps treating a stale action as
+        checked, which breaks exclusivity and lets S toggle Select back off.
+        """
+        self._act_select.setChecked(True)
+        self._pre_pan_action = self._act_select
+        # setChecked is a no-op when it was already checked, so no toggled
+        # signal fires and the mode has to be set here.
+        if self.canvas.current_mode != "select":
+            self.canvas.set_mode(Mode.SELECT)
 
     @staticmethod
     def _step_list(list_widget: QListWidget, delta: int) -> None:
@@ -966,6 +1027,37 @@ class MainWindow(QMainWindow):
                 break
         self._mark_modified()
         self._show_class_contours()
+
+    def _on_canvas_select(self, x: float, y: float) -> None:
+        """Arrow-tool click: select whichever label covers this pixel."""
+        if self.current_img_ann is None:
+            return
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            return
+        ix, iy = int(x), int(y)
+        if not (0 <= ix < mgr.width and 0 <= iy < mgr.height):
+            return
+
+        hits = [a for a in mgr.annotations()
+                if a.bbox is not None
+                and a.bbox[0] <= ix < a.bbox[2] and a.bbox[1] <= iy < a.bbox[3]
+                and a.mask[iy, ix]]
+        if not hits:
+            self._label_list.setCurrentRow(-1)   # clicking empty space deselects
+            return
+        # Overlapping annotations: prefer the smallest, so a label nested inside
+        # a larger one stays reachable.
+        target = min(hits, key=lambda a: int(a.mask.sum()))
+
+        for i in range(self._label_list.count()):
+            item = self._label_list.item(i)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == target.ann_id:
+                self._label_list.setCurrentRow(i)
+                break
+        # Selecting a label arms the brush; undo that so the arrow tool stays
+        # active and the user can keep clicking from label to label.
+        self._act_select.setChecked(True)
 
     def _on_class_clicked(self, _) -> None:
         self.canvas.clear_edit_annotation()
@@ -1143,6 +1235,7 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, mode_str: str) -> None:
         labels = {
             "idle":  "Mode: Idle",
+            "select": "Mode: Select  (click a label to select  /  drag its points to edit)",
             "pan":   "Mode: Pan  (drag to move image)",
             "draw":  "Mode: Draw  (double-click or snap to close)",
             "brush": "Mode: Brush  (LMB: paint  /  RMB: erase)",
@@ -1386,9 +1479,14 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _update_title(self) -> None:
-        base = os.path.basename(self.image_dir) if self.image_dir else "HyLabel"
+        if not self.image_dir:
+            self.setWindowTitle("HyLabel")
+            return
+        base = os.path.basename(self.image_dir)
+        item = self._img_list.currentItem()
+        name = f"  /  {item.text()}" if item is not None else ""
         marker = " *" if self._modified else ""
-        self.setWindowTitle(f"HyLabel — {base}{marker}")
+        self.setWindowTitle(f"HyLabel — {base}{name}{marker}")
 
     def _confirm_discard(self) -> bool:
         if not self._modified:

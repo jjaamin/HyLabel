@@ -26,11 +26,12 @@ FAINT_LEVELS = (0.8, 0.30, 0.08)
 
 
 class Mode(Enum):
-    IDLE  = auto()
-    PAN   = auto()
-    DRAW  = auto()
-    BRUSH = auto()
-    MAGIC = auto()
+    IDLE   = auto()
+    SELECT = auto()
+    PAN    = auto()
+    DRAW   = auto()
+    BRUSH  = auto()
+    MAGIC  = auto()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -188,6 +189,7 @@ class ImageCanvas(QGraphicsView):
     edit_cleared         = pyqtSignal()
     undo_record          = pyqtSignal(object)  # dict pushed to window undo stack
     magic_requested      = pyqtSignal(object, object)  # (points, labels) → window runs SAM
+    select_requested     = pyqtSignal(float, float)    # scene x, y → window picks a label
 
     def __init__(self, parent=None) -> None:
         scene = QGraphicsScene()
@@ -507,6 +509,15 @@ class ImageCanvas(QGraphicsView):
                 if self._contour_overlay:
                     self._contour_overlay.clear()
                 return
+
+        # Plain click with the arrow tool picks whatever label is under the
+        # cursor. Sits below the control-point branch on purpose, so dragging a
+        # vertex of the already-selected label still wins over re-picking.
+        if self._mode == Mode.SELECT:
+            if event.button() == Qt.MouseButton.LeftButton:
+                sp = self.mapToScene(event.position().toPoint())
+                self.select_requested.emit(sp.x(), sp.y())
+            return
 
         if self._mode == Mode.BRUSH:
             if event.button() == Qt.MouseButton.LeftButton:
