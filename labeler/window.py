@@ -3,7 +3,7 @@ import contextlib
 import os
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QSize, QSettings
+from PyQt6.QtCore import Qt, QSize, QSettings, QItemSelectionModel
 from PyQt6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
@@ -299,6 +299,7 @@ class MainWindow(QMainWindow):
 
         # undo stack: list of operation dicts (cleared on image change)
         self._undo_stack: List[dict] = []
+        self._syncing_selection = False
 
         self._build_ui()
         self._connect_signals()
@@ -496,17 +497,26 @@ class MainWindow(QMainWindow):
         lg.setStyleSheet("QGroupBox { font-weight: normal; }")
         lav = QVBoxLayout(lg)
         self._label_list = QListWidget()
-        self._label_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._label_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
         lav.addWidget(self._label_list)
         self._btn_clear_label = QPushButton("Delete Selected Label")
         lav.addWidget(self._btn_clear_label)
+        self._btn_merge_labels = QPushButton("Merge Selected Labels  (Home)")
+        self._btn_merge_labels.setEnabled(False)
+        self._btn_merge_labels.setToolTip(
+            "Combine the selected labels into one.\n"
+            "Ctrl+click to pick several, on the canvas or in this list."
+        )
+        lav.addWidget(self._btn_merge_labels)
         self._label_class_combo = QComboBox()
         self._label_class_combo.setEnabled(False)
         self._label_class_combo.setToolTip("Change class of selected label")
         lav.addWidget(self._label_class_combo)
-        rv.addWidget(lg, 1)
+        rv.addWidget(lg, 3)
 
-        # Images section
+        # Images section — deliberately the smaller of the two lists; labelling
+        # works out of Labels, and Images is mostly for jumping between files.
         img_lbl = QLabel("Images")
         img_lbl.setStyleSheet("margin-top: 4px;")
         rv.addWidget(img_lbl)
@@ -530,6 +540,7 @@ class MainWindow(QMainWindow):
         # brush tool, which hands focus to the canvas, so a key filter on the
         # label list never sees the keystroke.
         self._act_label_del = QAction(self, shortcut="Delete")
+        self._act_label_merge = QAction(self, shortcut="Home")
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
         self.addAction(self._act_pan_toggle)
@@ -540,6 +551,7 @@ class MainWindow(QMainWindow):
         self.addAction(self._act_label_prev)
         self.addAction(self._act_label_next)
         self.addAction(self._act_label_del)
+        self.addAction(self._act_label_merge)
 
         # Status bar
         sb = QStatusBar(self)
@@ -583,6 +595,7 @@ class MainWindow(QMainWindow):
         self._act_label_prev.triggered.connect(lambda: self._step_list(self._label_list, -1))
         self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
         self._act_label_del.triggered.connect(self._clear_active_label)
+        self._act_label_merge.triggered.connect(self._merge_selected_labels)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
 
@@ -604,7 +617,10 @@ class MainWindow(QMainWindow):
         self.canvas.edit_changed.connect(self._on_edit_changed)
         self.canvas.edit_cleared.connect(self._on_edit_cleared)
         self.canvas.mode_changed.connect(self._on_mode_changed)
-        self._label_list.currentRowChanged.connect(self._on_label_selected)
+        # itemSelectionChanged, not currentRowChanged: with several rows picked
+        # the current row alone does not describe the selection.
+        self._label_list.itemSelectionChanged.connect(self._on_label_selection_changed)
+        self._btn_merge_labels.clicked.connect(self._merge_selected_labels)
 
     # ── file operations ───────────────────────────────────────────────────────
 
@@ -932,6 +948,72 @@ class MainWindow(QMainWindow):
         if remaining:
             self._label_list.setCurrentRow(min(row, remaining - 1))
 
+    def _merge_selected_labels(self) -> None:
+        """Combine the selected annotations into the first one."""
+        if self.current_img_ann is None:
+            return
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            return
+        ids = self._selected_ann_ids()
+        anns = [a for a in (mgr.get_annotation(i) for i in ids) if a is not None]
+        if len(anns) < 2:
+            self._lbl_status.setText(
+                "합칠 레이블을 2개 이상 선택하세요 (Ctrl+클릭).")
+            return
+
+        keep = anns[0]
+        cat_map = {c.id: c for c in self.project.categories}
+        other_cats = {a.cat_id for a in anns} - {keep.cat_id}
+        if other_cats:
+            # Merging across classes silently discards the others' class, so
+            # make the surviving one explicit before doing it.
+            keep_name = cat_map[keep.cat_id].name if keep.cat_id in cat_map else "?"
+            names = ", ".join(sorted(
+                cat_map[c].name for c in other_cats if c in cat_map))
+            if QMessageBox.question(
+                self, "Merge across classes",
+                f"선택한 레이블의 클래스가 다릅니다 ({names} → {keep_name}).\n"
+                f"합친 결과는 '{keep_name}' 으로 남습니다. 계속할까요?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        self._push_undo({
+            "type": "anns_merged",
+            "keep_id": keep.ann_id,
+            "members": [{
+                "ann_id": a.ann_id,
+                "cat_id": a.cat_id,
+                "mask": a.mask.copy(),
+                "index": mgr.annotation_index(a.ann_id),
+                "polygons": (
+                    [[[x, y] for x, y in p] for p in a.original_polygons]
+                    if a.original_polygons is not None else None),
+            } for a in anns],
+        })
+
+        rect = keep.bbox
+        union = keep.mask.copy()
+        for a in anns[1:]:
+            union |= a.mask
+            rect = MaskManager.union_bbox(rect, a.bbox)
+        self.canvas.clear_edit_annotation()
+        keep.mask[:] = union
+        # The merged outline no longer matches any authored polygon, so the mask
+        # becomes the source of truth and save extracts the combined contour.
+        keep.original_polygons = None
+        mgr.recompute_bbox(keep.ann_id)
+        for a in anns[1:]:
+            mgr.remove_annotation(a.ann_id)
+
+        self.canvas.refresh_overlay(rect)
+        self._refresh_labels()
+        self._mark_modified()
+        row = self._row_of_ann(keep.ann_id)
+        if row >= 0:
+            self._label_list.setCurrentRow(row)
+        self._lbl_status.setText(f"{len(anns)}개 레이블을 하나로 합쳤습니다.")
+
     # ── tool toggling ─────────────────────────────────────────────────────────
 
     def _on_tool_toggled(self, checked: bool) -> None:
@@ -1063,8 +1145,12 @@ class MainWindow(QMainWindow):
         self._mark_modified()
         self._show_class_contours()
 
-    def _on_canvas_select(self, x: float, y: float) -> None:
-        """Arrow-tool click: select whichever label covers this pixel."""
+    def _on_canvas_select(self, x: float, y: float, additive: bool) -> None:
+        """Arrow-tool click: select whichever label covers this pixel.
+
+        additive (Ctrl held) toggles the label in the current selection instead
+        of replacing it, so several can be picked for merging.
+        """
         if self.current_img_ann is None:
             return
         mgr = self._mask_managers.get(self.current_img_ann.image_id)
@@ -1079,20 +1165,66 @@ class MainWindow(QMainWindow):
                 and a.bbox[0] <= ix < a.bbox[2] and a.bbox[1] <= iy < a.bbox[3]
                 and a.mask[iy, ix]]
         if not hits:
-            self._label_list.setCurrentRow(-1)   # clicking empty space deselects
+            if not additive:     # plain click on empty space deselects
+                self._label_list.clearSelection()
+                self._label_list.setCurrentRow(-1)
             return
         # Overlapping annotations: prefer the smallest, so a label nested inside
         # a larger one stays reachable.
         target = min(hits, key=lambda a: int(a.mask.sum()))
+        row = self._row_of_ann(target.ann_id)
+        if row < 0:
+            return
 
-        for i in range(self._label_list.count()):
-            item = self._label_list.item(i)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == target.ann_id:
-                self._label_list.setCurrentRow(i)
-                break
+        item = self._label_list.item(row)
+        if additive:
+            item.setSelected(not item.isSelected())
+            # NoUpdate: the plain setCurrentItem() overload applies
+            # ClearAndSelect, which would wipe the very selection being built.
+            self._label_list.setCurrentItem(
+                item, QItemSelectionModel.SelectionFlag.NoUpdate)
+        else:
+            self._label_list.setCurrentRow(row)
         # Selecting a label arms the brush; undo that so the arrow tool stays
         # active and the user can keep clicking from label to label.
         self._act_select.setChecked(True)
+
+    def _row_of_ann(self, ann_id: int) -> int:
+        for i in range(self._label_list.count()):
+            item = self._label_list.item(i)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == ann_id:
+                return i
+        return -1
+
+    def _selected_ann_ids(self) -> List[int]:
+        """Selected annotation ids, in list order."""
+        return [self._label_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self._label_list.count())
+                if self._label_list.item(i).isSelected()]
+
+    def _on_label_selection_changed(self) -> None:
+        """Route the selection: one row edits, several only highlight."""
+        rows = [i for i in range(self._label_list.count())
+                if self._label_list.item(i).isSelected()]
+        self._btn_merge_labels.setEnabled(len(rows) >= 2)
+
+        if len(rows) == 1:
+            self._on_label_selected(rows[0])
+            return
+
+        # Zero or many: no single annotation to edit, so leave edit mode and let
+        # _show_class_contours() outline whatever is selected.
+        self._syncing_selection = True
+        try:
+            self.canvas.clear_edit_annotation()
+        finally:
+            self._syncing_selection = False
+        self._clear_label_bold()
+        self._update_label_class_combo()
+        self._show_class_contours()
+        if len(rows) >= 2:
+            self._lbl_mode.setText(
+                f"{len(rows)} labels selected  (Home = merge)")
 
     def _on_class_clicked(self, _) -> None:
         self.canvas.clear_edit_annotation()
@@ -1100,15 +1232,31 @@ class MainWindow(QMainWindow):
         self._show_class_contours()
 
     def _show_class_contours(self) -> None:
-        row = self._class_list.currentRow()
-        if row < 0 or self.current_img_ann is None:
+        """Read-only outline dots on the canvas.
+
+        A multi-selection takes priority: with two labels picked for merging the
+        user needs to see *those*, not every label of the active class. One or
+        no selection falls back to the class overview.
+        """
+        if self.current_img_ann is None:
             self.canvas.clear_class_contours()
             return
-        cat_id = self._class_list.item(row).data(Qt.ItemDataRole.UserRole)
         mgr = self._mask_managers.get(self.current_img_ann.image_id)
         if mgr is None:
             self.canvas.clear_class_contours()
             return
+
+        selected = set(self._selected_ann_ids())
+        if len(selected) >= 2:
+            masks = [a.mask for a in mgr.annotations() if a.ann_id in selected]
+            self.canvas.show_class_contours(masks)
+            return
+
+        row = self._class_list.currentRow()
+        if row < 0:
+            self.canvas.clear_class_contours()
+            return
+        cat_id = self._class_list.item(row).data(Qt.ItemDataRole.UserRole)
         masks = [ann.mask for ann in mgr.annotations() if ann.cat_id == cat_id]
         self.canvas.show_class_contours(masks)
 
@@ -1116,11 +1264,9 @@ class MainWindow(QMainWindow):
         count = self._label_list.count()
         if count == 0:
             return
-        last = count - 1
-        self._label_list.blockSignals(True)
-        self._label_list.setCurrentRow(last)
-        self._label_list.blockSignals(False)
-        self._on_label_selected(last)
+        # Signals left live so the selection handler runs and resets the
+        # multi-select state (merge button, mode label) along with it.
+        self._label_list.setCurrentRow(count - 1)
 
     def _on_label_selected(self, row: int) -> None:
         if row < 0 or self.current_img_ann is None:
@@ -1158,10 +1304,14 @@ class MainWindow(QMainWindow):
         self._mark_modified()
 
     def _on_edit_cleared(self) -> None:
-        self._label_list.blockSignals(True)
-        self._label_list.clearSelection()
-        self._label_list.setCurrentRow(-1)
-        self._label_list.blockSignals(False)
+        # Skip the selection reset when we are the ones who ended edit mode:
+        # picking a second label leaves single-edit, and wiping the list here
+        # would destroy the multi-selection the user is building.
+        if not self._syncing_selection:
+            self._label_list.blockSignals(True)
+            self._label_list.clearSelection()
+            self._label_list.setCurrentRow(-1)
+            self._label_list.blockSignals(False)
         self._clear_label_bold()
         self._update_label_class_combo()
         self._update_class_bold(self._class_list.currentRow())
@@ -1241,6 +1391,26 @@ class MainWindow(QMainWindow):
             restored = mgr.get_annotation(record["ann_id"])
             self.canvas.refresh_overlay(
                 restored.bbox if restored is not None else None)
+            self._refresh_labels()
+            self._mark_modified()
+
+        elif t == "anns_merged":
+            if self.current_img_ann is None:
+                return
+            mgr = self._mask_managers.get(self.current_img_ann.image_id)
+            if mgr is None:
+                return
+            self.canvas.clear_edit_annotation()
+            merged = mgr.get_annotation(record["keep_id"])
+            rect = merged.bbox if merged is not None else None
+            mgr.remove_annotation(record["keep_id"])
+            # Ascending index order, so each insert lands where it started.
+            for m in sorted(record["members"], key=lambda d: d["index"]):
+                mgr.restore_annotation(m["ann_id"], m["cat_id"], m["mask"],
+                                       m["index"], m["polygons"])
+                rect = MaskManager.union_bbox(
+                    rect, mgr.get_annotation(m["ann_id"]).bbox)
+            self.canvas.refresh_overlay(rect)
             self._refresh_labels()
             self._mark_modified()
 

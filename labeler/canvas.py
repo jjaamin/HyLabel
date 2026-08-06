@@ -189,7 +189,7 @@ class ImageCanvas(QGraphicsView):
     edit_cleared         = pyqtSignal()
     undo_record          = pyqtSignal(object)  # dict pushed to window undo stack
     magic_requested      = pyqtSignal(object, object)  # (points, labels) → window runs SAM
-    select_requested     = pyqtSignal(float, float)    # scene x, y → window picks a label
+    select_requested     = pyqtSignal(float, float, bool)  # scene x, y, ctrl-held → window picks a label
 
     def __init__(self, parent=None) -> None:
         scene = QGraphicsScene()
@@ -516,7 +516,9 @@ class ImageCanvas(QGraphicsView):
         if self._mode == Mode.SELECT:
             if event.button() == Qt.MouseButton.LeftButton:
                 sp = self.mapToScene(event.position().toPoint())
-                self.select_requested.emit(sp.x(), sp.y())
+                additive = bool(event.modifiers()
+                                & Qt.KeyboardModifier.ControlModifier)
+                self.select_requested.emit(sp.x(), sp.y(), additive)
             return
 
         if self._mode == Mode.BRUSH:
