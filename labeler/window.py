@@ -503,10 +503,12 @@ class MainWindow(QMainWindow):
         lav.addWidget(self._label_list)
         self._btn_clear_label = QPushButton("Delete Selected Label")
         lav.addWidget(self._btn_clear_label)
-        self._btn_merge_labels = QPushButton("Merge Selected Labels  (Home)")
+        self._btn_merge_labels = QPushButton("Merge Selected Labels")
         self._btn_merge_labels.setEnabled(False)
+        # Shortcut lives in the tooltip rather than the caption, which keeps the
+        # button reading the same as the Delete one above it.
         self._btn_merge_labels.setToolTip(
-            "Combine the selected labels into one.\n"
+            "Combine the selected labels into one.  (Home)\n"
             "Ctrl+click to pick several, on the canvas or in this list."
         )
         lav.addWidget(self._btn_merge_labels)
