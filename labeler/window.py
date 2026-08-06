@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import os
 from typing import Dict, List, Optional
 
@@ -7,7 +8,7 @@ from PyQt6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QPa
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
     QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QSplitter, QStatusBar,
+    QMessageBox, QProgressDialog, QPushButton, QSlider, QSplitter, QStatusBar,
     QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -626,19 +627,50 @@ class MainWindow(QMainWindow):
             self._img_list.addItem(f)
 
         if files and coco_io.has_labelme_annotations(folder, files):
-            try:
-                proj, mgrs = coco_io.load_labelme(folder, files)
-                self.project = proj
-                self._mask_managers = mgrs
-                self.save_path = folder
-                self._refresh_class_list()
-            except Exception:
-                pass
+            with self._loading_progress(f"{os.path.basename(folder)} 여는 중…") as tick:
+                try:
+                    proj, mgrs = coco_io.load_labelme(folder, files, progress=tick)
+                    self.project = proj
+                    self._mask_managers = mgrs
+                    self.save_path = folder
+                    self._refresh_class_list()
+                except Exception:
+                    pass
 
         self._refresh_image_icons()
         if files:
             self._img_list.setCurrentRow(0)
         self._update_title()
+
+    @contextlib.contextmanager
+    def _loading_progress(self, label: str):
+        """Yield a progress(done, total) callback backed by a QProgressDialog.
+
+        Reading a folder's annotations takes about 17ms per image, so a few
+        hundred images is a multi-second freeze with no feedback. The dialog
+        only appears once the work has already run past minimumDuration, which
+        keeps small folders from flashing a box open and shut.
+
+        No cancel button: aborting midway would leave the project half-loaded,
+        and the point here is feedback rather than control.
+        """
+        dlg = QProgressDialog(label, None, 0, 100, self)
+        dlg.setWindowTitle("HyLabel")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(400)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+
+        def tick(done: int, total: int) -> None:
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+            QApplication.processEvents()
+
+        try:
+            yield tick
+        finally:
+            dlg.close()
 
     def _open_file(self) -> None:
         if not self._confirm_discard():
@@ -696,7 +728,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Images", "Open an image folder first.")
             return
         try:
-            proj, mgrs = coco_io.load_labelme(directory, files)
+            with self._loading_progress(
+                f"{os.path.basename(directory)} 어노테이션 불러오는 중…"
+            ) as tick:
+                proj, mgrs = coco_io.load_labelme(directory, files, progress=tick)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{e}")
             return

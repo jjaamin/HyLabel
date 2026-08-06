@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -89,14 +89,30 @@ def save_labelme(
 def load_labelme(
     json_dir: str,
     image_filenames: List[str],
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[Project, Dict[int, MaskManager]]:
     """
     Load LabelMe JSON files from json_dir that correspond to image_filenames.
     Returns (project, mask_managers).
+
+    progress(done, total) is called as work completes, so the caller can drive a
+    progress bar. Rasterising every polygon costs roughly 17ms per image, which
+    is a multi-second wait on a large folder. Both passes report into the same
+    scale — reading the JSON is counted as the first half of each file's work
+    and rasterising as the second — so the bar advances smoothly rather than
+    filling twice.
     """
     project = Project()
     mask_managers: Dict[int, MaskManager] = {}
     label_to_cat: dict = {}
+    total = max(1, len(image_filenames) * 2)
+    done = 0
+
+    def _tick() -> None:
+        nonlocal done
+        done += 1
+        if progress is not None:
+            progress(done, total)
 
     # First pass — collect unique labels to build a stable category list
     raw: Dict[str, dict] = {}
@@ -104,10 +120,12 @@ def load_labelme(
         stem = os.path.splitext(fname)[0]
         json_path = os.path.join(json_dir, stem + ".json")
         if not os.path.isfile(json_path):
+            _tick()
             continue
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
         raw[fname] = data
+        _tick()
         for shape in data.get("shapes", []):
             label = shape.get("label", "").strip()
             if label and label not in label_to_cat:
@@ -115,10 +133,12 @@ def load_labelme(
                 label_to_cat[label] = cat
 
     # Second pass — rasterize shapes per image
+    skipped = len(image_filenames) - len(raw)
     for fname, data in raw.items():
         w = data.get("imageWidth", 0)
         h = data.get("imageHeight", 0)
         if w <= 0 or h <= 0:
+            _tick()
             continue
 
         img_path = os.path.join(json_dir, fname)
@@ -145,6 +165,12 @@ def load_labelme(
                     ann.original_polygons = [pts_float]
 
         mask_managers[img_ann.image_id] = mgr
+        _tick()
+
+    # Files with no JSON never reach the second pass; close the gap so the bar
+    # ends full instead of stalling short.
+    for _ in range(skipped):
+        _tick()
 
     return project, mask_managers
 
