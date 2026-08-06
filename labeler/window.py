@@ -850,6 +850,16 @@ class MainWindow(QMainWindow):
         self._mark_modified()
         self._show_class_contours()
 
+        # Removing an annotation clears the selection, which drops the user back
+        # on the Classes panel. Move to the row that slid up into the deleted
+        # one's place instead — or the new last row if we deleted the bottom one
+        # — so deleting several in a row does not need a trip back to the list.
+        # Done last so the currentRowChanged handler, which enters edit mode,
+        # runs after _show_class_contours() and clears the class dots itself.
+        remaining = self._label_list.count()
+        if remaining:
+            self._label_list.setCurrentRow(min(row, remaining - 1))
+
     # ── tool toggling ─────────────────────────────────────────────────────────
 
     def _on_tool_toggled(self, checked: bool) -> None:
