@@ -366,7 +366,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
 
         # Tool group (exclusive): Select / Draw / Brush / Magic / Pan
-        self._act_select = QAction(self, shortcut="S", checkable=True)
+        self._act_select = QAction(self, shortcut="A", checkable=True)
         self._act_draw  = QAction(self, shortcut="D", checkable=True)
         self._act_brush = QAction(self, shortcut="B", checkable=True)
         self._act_magic = QAction(self, shortcut="M", checkable=True)
@@ -374,7 +374,8 @@ class MainWindow(QMainWindow):
 
         self._act_select.setIcon(_arrow_icon())
         self._act_select.setToolTip(
-            "Select  (S)  —  click a label on the canvas to select it"
+            "Select  (A)  —  click a label on the canvas to select it\n"
+            "Ctrl+click to pick several"
         )
         self._act_draw.setIcon(_polygon_icon())
         self._act_draw.setToolTip("Draw Polygon  (D)")
@@ -1185,9 +1186,6 @@ class MainWindow(QMainWindow):
                 item, QItemSelectionModel.SelectionFlag.NoUpdate)
         else:
             self._label_list.setCurrentRow(row)
-        # Selecting a label arms the brush; undo that so the arrow tool stays
-        # active and the user can keep clicking from label to label.
-        self._act_select.setChecked(True)
 
     def _row_of_ann(self, ann_id: int) -> int:
         for i in range(self._label_list.count()):
@@ -1287,9 +1285,11 @@ class MainWindow(QMainWindow):
             if ann.ann_id == ann_id:
                 cat = cat_map.get(ann.cat_id)
                 n = cat_counts[ann.cat_id]
+                # Whatever tool is active stays active. Selecting a label used
+                # to force the brush on, which meant deleting one and landing
+                # on the next silently swapped the user's tool out from under
+                # them. The hint already tells them B starts brushing.
                 self.canvas.set_edit_annotation(ann_id, ann.mask)
-                self._uncheck_all_tools()
-                self._act_brush.setChecked(True)
                 self._lbl_mode.setText(
                     f"Editing: {cat.name if cat else '?'}  #{n}"
                     "   (drag points / B=brush  M=done)"
@@ -1440,7 +1440,7 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, mode_str: str) -> None:
         labels = {
             "idle":  "Mode: Idle",
-            "select": "Mode: Select  (click a label to select  /  drag its points to edit)",
+            "select": "Mode: Select  (click a label  /  Ctrl+click for several  /  drag points to edit)",
             "pan":   "Mode: Pan  (drag to move image)",
             "draw":  "Mode: Draw  (double-click or snap to close)",
             "brush": "Mode: Brush  (LMB: paint  /  RMB: erase)",
