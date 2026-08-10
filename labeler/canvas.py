@@ -93,9 +93,13 @@ class _PointsItem(QGraphicsItem):
     single pass, sized in device pixels so they stay constant on screen.
     """
 
-    # Dot diameter tracks the zoom (radius_px is the size at 1:1), clamped so it
-    # neither vanishes when zoomed out nor swallows the image when zoomed in.
-    MIN_DOT_PX = 1.0
+    # Dot diameter tracks the zoom (radius_px is the size at 1:1). No floor on
+    # the low end: a dense CHAIN_APPROX_NONE contour has a point on every
+    # boundary pixel, so a fixed minimum width reads as a solid band tracing
+    # the shape once zoomed out far enough — thinner is more correct there,
+    # not a bug to guard against. MAX_DOT_PX still caps the high end so a dot
+    # can't swallow the image when zoomed in close.
+    MIN_DOT_PX = 0.0
     MAX_DOT_PX = 14.0
 
     def __init__(self, radius_px: float, color: QColor, z: int) -> None:
@@ -179,13 +183,6 @@ class _PointsItem(QGraphicsItem):
                 painter.drawPoints(poly)
 
 
-def _solid_rgba(mask: np.ndarray, color: Tuple[int, int, int]) -> np.ndarray:
-    """RGBA where mask>0 is opaque `color`, elsewhere fully transparent."""
-    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    rgba[mask > 0] = (*color, 255)
-    return rgba
-
-
 def _disc_footprint_path(radius: int) -> QPainterPath:
     """Outline of exactly the pixels cv2.circle() fills at this radius.
 
@@ -218,6 +215,34 @@ def _disc_footprint_path(radius: int) -> QPainterPath:
         path.moveTo(x + 1 - off, y - off)
         path.lineTo(x + 1 - off, y + 1 - off)
 
+    return path
+
+
+def _disc_fill_path(radius: int) -> QPainterPath:
+    """Closed fill region for the same footprint _disc_footprint_path() traces.
+
+    That one is disjoint edge segments — fine to stroke, but filling it draws
+    nothing (a straight segment has no interior) and combining the two edge
+    networks in one path would additionally stroke every fill rectangle's own
+    border, striping the disc with unwanted lines. Kept separate instead.
+
+    A circle's rows are each a single contiguous run of filled pixels, so the
+    exact filled region is just one rectangle per row — cheaper than a full
+    boundary trace, and unambiguous since it uses the same "pixel (px, py)
+    spans scene [px, px+1)" convention directly rather than round-tripping
+    through cv2.findContours' pixel-center points.
+    """
+    n = 2 * radius + 3
+    disc = np.zeros((n, n), np.uint8)
+    cv2.circle(disc, (radius + 1, radius + 1), radius, 1, -1)
+    off = radius + 1
+    path = QPainterPath()
+    for y in range(n):
+        xs = np.nonzero(disc[y])[0]
+        if xs.size == 0:
+            continue
+        x0, x1 = int(xs[0]), int(xs[-1]) + 1
+        path.addRect(x0 - off, y - off, x1 - x0, 1)
     return path
 
 
@@ -266,6 +291,7 @@ class ImageCanvas(QGraphicsView):
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._overlay_item: Optional[_MaskOverlayItem] = None
         self._brush_ring: Optional[QGraphicsPathItem] = None
+        self._brush_fill: Optional[QGraphicsPathItem] = None
 
         self._mask_manager: Optional[MaskManager] = None
         self._cat_colors: Dict[int, Tuple[int, int, int]] = {}
@@ -277,7 +303,7 @@ class ImageCanvas(QGraphicsView):
         self._edit_cat_id: int = -1
 
         # contour / control points
-        self._contour_overlay: Optional[_MaskOverlayItem] = None  # brush opaque preview
+        self._contour_overlay: Optional[_MaskOverlayItem] = None  # unused; kept idle for now
         self._cp_contours: List[List[Tuple[float, float]]] = []
         self._cp_arrays: List[np.ndarray] = []   # same data, (n,2) float for hit-test
         self._cp_path_items: List[QGraphicsPathItem] = []   # drag preview only
@@ -347,13 +373,6 @@ class ImageCanvas(QGraphicsView):
         self._faint_level = level % len(FAINT_LEVELS)
         if self._overlay_item is not None:
             self._overlay_item.setOpacity(FAINT_LEVELS[self._faint_level])
-        # The brush preview is a separate item so the annotation being edited
-        # reads clearly even where it overlaps others, but it must still track
-        # V — pinning it to always-opaque was a regression: V stopped doing
-        # anything visible while brushing, since this item sat on top at full
-        # opacity regardless of the overlay's level.
-        if self._contour_overlay is not None:
-            self._contour_overlay.setOpacity(FAINT_LEVELS[self._faint_level])
 
     def set_gamma_lut(self, lut: np.ndarray) -> None:
         self._gamma_lut = lut
@@ -413,7 +432,6 @@ class ImageCanvas(QGraphicsView):
                 MaskManager.compute_bbox(mask))
             self._pending_mask[:] = mask
             self._refresh_overlay_rect(rect)
-            self._sync_edit_overlay()
 
     def refresh_edit_contour(self) -> None:
         """Refresh control-point dots after an external mask change (undo)."""
@@ -436,8 +454,8 @@ class ImageCanvas(QGraphicsView):
         pixmap = QPixmap(path)
         self._original_pixmap = pixmap
         scene = self.scene()
-        for item in (self._pixmap_item, self._overlay_item,
-                     self._contour_overlay, self._brush_ring):
+        for item in (self._pixmap_item, self._overlay_item, self._contour_overlay,
+                     self._brush_ring, self._brush_fill):
             if item is not None:
                 scene.removeItem(item)
 
@@ -456,8 +474,13 @@ class ImageCanvas(QGraphicsView):
 
         self._contour_overlay = _MaskOverlayItem(w, h)
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)
-        self._contour_overlay.setOpacity(FAINT_LEVELS[self._faint_level])
         scene.addItem(self._contour_overlay)
+
+        self._brush_fill = QGraphicsPathItem()
+        self._brush_fill.setZValue(99)       # under the ring's outline stroke
+        self._brush_fill.setPen(QPen(Qt.PenStyle.NoPen))
+        self._brush_fill.hide()
+        scene.addItem(self._brush_fill)
 
         self._brush_ring = QGraphicsPathItem()
         self._brush_ring.setZValue(100)
@@ -467,7 +490,8 @@ class ImageCanvas(QGraphicsView):
         self._brush_ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self._brush_ring.hide()
         scene.addItem(self._brush_ring)
-        self._brush_fp_radius = -1          # radius the cached path was built for
+        self._brush_fp_radius = -1          # radius the cached paths were built for
+        self._brush_fill_color: Optional[Tuple[int, int, int]] = None
 
         self._mask_manager = None
         return w, h
@@ -498,7 +522,6 @@ class ImageCanvas(QGraphicsView):
     def update_cat_colors(self, cat_colors: Dict[int, Tuple[int, int, int]]) -> None:
         self._cat_colors = cat_colors
         self._refresh_overlay_full()
-        self._sync_edit_overlay()
 
     def refresh_overlay(self, rect: Optional[Tuple[int, int, int, int]] = None) -> None:
         """Repaint the mask overlay. Pass the affected (x1,y1,x2,y2) when known —
@@ -510,7 +533,6 @@ class ImageCanvas(QGraphicsView):
 
     def set_active_category(self, cat_id: int) -> None:
         self._active_cat_id = cat_id
-        self._sync_edit_overlay()
 
     def set_mode(self, mode: Mode) -> None:
         if mode == self._mode:
@@ -531,7 +553,6 @@ class ImageCanvas(QGraphicsView):
         # Update control point dot appearance on mode change
         if self._edit_ann_id >= 0 and self._cp_dots is not None:
             self._cp_dots.set_style(*self._cp_dot_style())
-        self._sync_edit_overlay()
         self.mode_changed.emit(mode.name.lower())
 
     def set_brush_size(self, size: int) -> None:
@@ -610,7 +631,6 @@ class ImageCanvas(QGraphicsView):
         self._edit_mask = None
         self._edit_cat_id = -1
         self._clear_contour()
-        self._sync_edit_overlay()
         self.edit_cleared.emit()
 
     @property
@@ -709,6 +729,8 @@ class ImageCanvas(QGraphicsView):
                 and self._mode != Mode.PAN):
             if self._brush_ring:
                 self._brush_ring.hide()
+            if self._brush_fill:
+                self._brush_fill.hide()
             super().mouseMoveEvent(event)
             return
 
@@ -855,13 +877,18 @@ class ImageCanvas(QGraphicsView):
         super().keyReleaseEvent(event)
 
     def enterEvent(self, event) -> None:
-        if self._mode == Mode.BRUSH and self._brush_ring:
-            self._brush_ring.show()
+        if self._mode == Mode.BRUSH:
+            if self._brush_ring:
+                self._brush_ring.show()
+            if self._brush_fill:
+                self._brush_fill.show()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         if self._brush_ring:
             self._brush_ring.hide()
+        if self._brush_fill:
+            self._brush_fill.hide()
         super().leaveEvent(event)
 
     # ── contour / control points ──────────────────────────────────────────────
@@ -890,7 +917,6 @@ class ImageCanvas(QGraphicsView):
     def _show_contour(self) -> None:
         """Pixel-perfect boundary overlay + draggable control point dots."""
         self._clear_contour()
-        self._sync_edit_overlay()
         if self._edit_mask is None or self._contour_overlay is None:
             return
 
@@ -929,42 +955,13 @@ class ImageCanvas(QGraphicsView):
             return 4.0, QColor(255, 255, 0, 110)
         return 3.0, QColor("#FFFF00")
 
-    # ── brush opaque preview ─────────────────────────────────────────────────
-    #
-    # _overlay_item's opacity is one global slider (V / faint level), which can
-    # be low enough that a brush stroke's exact extent is hard to judge while
-    # painting. _contour_overlay sits idle the rest of the time, so it is
-    # repurposed here to show whatever mask the brush is currently touching —
-    # the annotation being edited, or a not-yet-committed pending shape — in
-    # its class color at full opacity, regardless of the faint level.
-
-    def _edit_brush_target(self) -> Tuple[Optional[np.ndarray], Tuple[int, int, int]]:
-        """Mask the opaque preview should track right now, and its color.
-
-        None when nothing qualifies (not in Brush mode, or nothing to paint).
-        """
-        if self._mode != Mode.BRUSH:
-            return None, (0, 0, 0)
-        if self._edit_ann_id >= 0 and self._edit_mask is not None:
-            return self._edit_mask, self._cat_colors.get(self._edit_cat_id, (255, 255, 0))
-        if self._pending_mask is not None and self._active_cat_id >= 0:
-            return self._pending_mask, self._cat_colors.get(self._active_cat_id, (255, 255, 0))
-        return None, (0, 0, 0)
-
-    def _sync_edit_overlay(self) -> None:
-        """Full rebuild of the brush opaque-preview layer.
-
-        For tool/mode switches, undo, and stroke end — an infrequent enough
-        event that rebuilding the whole array is fine. _do_paint() keeps it
-        live mid-stroke with a much cheaper per-region update instead.
-        """
-        if self._contour_overlay is None:
-            return
-        mask, color = self._edit_brush_target()
-        if mask is None:
-            self._contour_overlay.clear()
-            return
-        self._contour_overlay.fill_all(_solid_rgba(mask, color))
+    def _brush_target_color(self) -> Tuple[int, int, int]:
+        """Class color the brush is currently painting with — the annotation
+        being edited if one is active, otherwise the active class for a new
+        pending shape. Used for the brush cursor's fill preview."""
+        if self._edit_ann_id >= 0:
+            return self._cat_colors.get(self._edit_cat_id, (255, 255, 0))
+        return self._cat_colors.get(self._active_cat_id, (255, 255, 0))
 
     def _clear_contour(self) -> None:
         if self._contour_overlay is not None:
@@ -1124,8 +1121,6 @@ class ImageCanvas(QGraphicsView):
             self._pending_polygons = None
         self._pending_mask[:] = 0
         self._refresh_overlay_rect(rect)
-        if self._contour_overlay is not None:
-            self._contour_overlay.clear()
         self.annotation_committed.emit(ann_id)
 
     def _discard_pending(self) -> None:
@@ -1134,8 +1129,6 @@ class ImageCanvas(QGraphicsView):
             rect = MaskManager.compute_bbox(self._pending_mask)
             self._pending_mask[:] = 0
             self._refresh_overlay_rect(rect)
-            if self._contour_overlay is not None:
-                self._contour_overlay.clear()
 
     def _edit_polygons_snapshot(self) -> Optional[List]:
         """Deep copy of the edited annotation's polygon, for the undo stack.
@@ -1352,10 +1345,6 @@ class ImageCanvas(QGraphicsView):
             if x2 > x1 and y2 > y1:
                 rgba = self._mask_manager.rgba_region(x1, y1, x2, y2, self._cat_colors)
                 self._overlay_item.refresh_region(rgba, x1, y1)
-                if self._contour_overlay is not None:
-                    color = self._cat_colors.get(self._edit_cat_id, (255, 255, 0))
-                    solid = _solid_rgba(self._edit_mask[y1:y2, x1:x2], color)
-                    self._contour_overlay.refresh_region(solid, x1, y1)
             # Brush invalidates polygon precision — must extract from mask on save
             ann = self._mask_manager.get_annotation(self._edit_ann_id)
             if ann is not None:
@@ -1373,10 +1362,6 @@ class ImageCanvas(QGraphicsView):
                 x1, y1, x2, y2 = MaskManager.erase_circle_on(self._pending_mask, ix, iy, r)
             if x2 > x1 and y2 > y1:
                 self._refresh_overlay_region(x1, y1, x2, y2)
-                if self._contour_overlay is not None and self._active_cat_id >= 0:
-                    color = self._cat_colors.get(self._active_cat_id, (255, 255, 0))
-                    solid = _solid_rgba(self._pending_mask[y1:y2, x1:x2], color)
-                    self._contour_overlay.refresh_region(solid, x1, y1)
 
     def _move_brush_ring(self, sp: QPointF) -> None:
         if self._brush_ring is None:
@@ -1385,7 +1370,20 @@ class ImageCanvas(QGraphicsView):
         if r != self._brush_fp_radius:
             # Shape only depends on the radius, so rebuild it just on resize.
             self._brush_ring.setPath(_disc_footprint_path(r))
+            if self._brush_fill is not None:
+                self._brush_fill.setPath(_disc_fill_path(r))
             self._brush_fp_radius = r
+        # Translucent class-color fill under the outline, so the footprint
+        # reads as "this area, this class" before the click lands rather than
+        # just an outline shape. The outline stays exactly as before — a thin
+        # fixed-width white ring with no brush of its own.
+        if self._brush_fill is not None:
+            color = self._brush_target_color()
+            if color != self._brush_fill_color:
+                self._brush_fill.setBrush(QBrush(QColor(*color, 110)))
+                self._brush_fill_color = color
+            self._brush_fill.setPos(int(round(sp.x())), int(round(sp.y())))
+            self._brush_fill.show()
         # Snap to the same pixel _do_paint() will use, or the preview would sit
         # up to half a pixel away from what actually gets painted.
         self._brush_ring.setPos(int(round(sp.x())), int(round(sp.y())))
@@ -1398,16 +1396,19 @@ class ImageCanvas(QGraphicsView):
             self.setCursor(Qt.CursorShape.BlankCursor)
         elif self._mode in (Mode.DRAW, Mode.LASSO, Mode.MAGIC):
             self.setCursor(Qt.CursorShape.CrossCursor)
-            if self._brush_ring:
-                self._brush_ring.hide()
+            self._hide_brush_cursor()
         elif self._mode == Mode.PAN:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
-            if self._brush_ring:
-                self._brush_ring.hide()
+            self._hide_brush_cursor()
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
-            if self._brush_ring:
-                self._brush_ring.hide()
+            self._hide_brush_cursor()
+
+    def _hide_brush_cursor(self) -> None:
+        if self._brush_ring:
+            self._brush_ring.hide()
+        if self._brush_fill:
+            self._brush_fill.hide()
 
     # ── magic wand ────────────────────────────────────────────────────────────
 
