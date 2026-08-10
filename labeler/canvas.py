@@ -223,7 +223,7 @@ class ImageCanvas(QGraphicsView):
     annotation_committed()   Enter commits pending → MaskManager
     stroke_finished()        brush mouse release
     mode_changed(str)        "idle" | "pan" | "draw" | "brush"
-    brush_size_changed(int)
+    brush_size_step(int)     Shift+wheel: +1 / -1, same step curve as [ / ]
     edit_changed()           brush or point-drag modified an existing annotation
     edit_cleared()           edit mode exited
     """
@@ -231,7 +231,7 @@ class ImageCanvas(QGraphicsView):
     annotation_committed = pyqtSignal(int)   # ann_id
     stroke_finished      = pyqtSignal()
     mode_changed         = pyqtSignal(str)
-    brush_size_changed   = pyqtSignal(int)
+    brush_size_step      = pyqtSignal(int)
     edit_changed         = pyqtSignal(int)   # ann_id
     edit_cleared         = pyqtSignal()
     undo_record          = pyqtSignal(object)  # dict pushed to window undo stack
@@ -249,6 +249,10 @@ class ImageCanvas(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#2b2b2b")))
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        self._img_w = 0
+        self._img_h = 0
+        self._updating_rect = False   # guards setSceneRect → resize reentry
 
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._overlay_item: Optional[_MaskOverlayItem] = None
@@ -412,8 +416,10 @@ class ImageCanvas(QGraphicsView):
         self._pixmap_item.setZValue(0)
         self._apply_pixmap_gamma()
         w, h = pixmap.width(), pixmap.height()
+        self._img_w, self._img_h = w, h
         scene.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._update_scene_rect()
 
         self._overlay_item = _MaskOverlayItem(w, h)
         scene.addItem(self._overlay_item)
@@ -498,8 +504,54 @@ class ImageCanvas(QGraphicsView):
             self._move_brush_ring(self._last_mouse_scene_pos)
 
     def fit_view(self) -> None:
-        if self._pixmap_item:
-            self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        if not self._pixmap_item:
+            return
+        # Drop the padding before fitting, then let _update_scene_rect() decide
+        # whether this zoom level still needs any.
+        self.scene().setSceneRect(QRectF(0, 0, self._img_w, self._img_h))
+        self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._update_scene_rect()
+
+    def zoom_by(self, factor: float) -> None:
+        """Zoom, then resize the scrollable area to match the new zoom level."""
+        self.scale(factor, factor)
+        self._update_scene_rect()
+
+    # ── scrollable area ───────────────────────────────────────────────────────
+
+    def _update_scene_rect(self) -> None:
+        """Pad the scene so any image pixel can be scrolled to the canvas centre.
+
+        Unpadded, the scroll range stops at the image border, so edge pixels can
+        only ever sit against the side of the viewport — the worst place to
+        label them. The padding is empty scene space: no pixmap, no overlay, and
+        the mask stays exactly w×h, so a brush stroke or polygon that strays
+        into it is simply clipped rather than interrupted.
+
+        Only the axis that does not currently fit gets padded, which keeps the
+        scrollbars away at fit-view.
+        """
+        if self._pixmap_item is None or self._updating_rect:
+            return
+        w, h = self._img_w, self._img_h
+        vis = self.mapToScene(self.viewport().rect()).boundingRect()
+        # Half a viewport of slack is exactly enough to bring a corner pixel to
+        # the centre, and no more. The half-pixel tolerance keeps fit-view —
+        # where vis matches the image to within rounding — on the zero branch.
+        mx = vis.width()  / 2.0 if vis.width()  < w - 0.5 else 0.0
+        my = vis.height() / 2.0 if vis.height() < h - 0.5 else 0.0
+        rect = QRectF(-mx, -my, w + 2 * mx, h + 2 * my)
+        if rect == self.sceneRect():
+            return
+        self._updating_rect = True
+        try:
+            self.scene().setSceneRect(rect)
+        finally:
+            self._updating_rect = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_scene_rect()
 
     # ── annotation edit API ───────────────────────────────────────────────────
 
@@ -686,8 +738,16 @@ class ImageCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event) -> None:
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self.scale(factor, factor)
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            # Window owns the step curve and the magic-mode variant, so route
+            # this through the same path as [ / ] instead of duplicating it.
+            self.brush_size_step.emit(1 if delta > 0 else -1)
+            event.accept()
+            return
+        self.zoom_by(1.15 if delta > 0 else 1 / 1.15)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()

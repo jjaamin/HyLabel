@@ -434,7 +434,8 @@ class MainWindow(QMainWindow):
         self._brush_slider.setRange(1, 88)
         self._brush_slider.setValue(20)
         self._brush_slider.setFixedHeight(24)
-        self._brush_slider.setToolTip("Brush / Eraser size  ( [ / ] to adjust )")
+        self._brush_slider.setToolTip(
+            "Brush / Eraser size  ( [ / ] or Shift + mouse wheel )")
         sh.addWidget(self._brush_slider)
         self._brush_size_lbl = QLabel("20")
         self._brush_size_lbl.setStyleSheet("font-size: 13px;")
@@ -581,15 +582,15 @@ class MainWindow(QMainWindow):
         self._act_draw.toggled.connect(self._on_tool_toggled)
         self._act_brush.toggled.connect(self._on_tool_toggled)
         self._act_magic.toggled.connect(self._on_tool_toggled)
-        self._act_zoom_in.triggered.connect(lambda: self.canvas.scale(1.2, 1.2))
-        self._act_zoom_out.triggered.connect(lambda: self.canvas.scale(1 / 1.2, 1 / 1.2))
+        self._act_zoom_in.triggered.connect(lambda: self.canvas.zoom_by(1.2))
+        self._act_zoom_out.triggered.connect(lambda: self.canvas.zoom_by(1 / 1.2))
         self._act_fit.triggered.connect(self.canvas.fit_view)
         self._act_faint.triggered.connect(self._toggle_faint)
         self._act_gamma.triggered.connect(self._toggle_gamma)
         self._act_gamma_curve.triggered.connect(self._open_gamma_dialog)
 
         self._brush_slider.valueChanged.connect(self._on_slider_changed)
-        self.canvas.brush_size_changed.connect(self._sync_slider)
+        self.canvas.brush_size_step.connect(self._adjust_size)
         self._act_brush_dec.triggered.connect(lambda: self._adjust_size(-1))
         self._act_brush_inc.triggered.connect(lambda: self._adjust_size(+1))
         self._act_pan_toggle.triggered.connect(self._toggle_pan)
@@ -1124,13 +1125,6 @@ class MainWindow(QMainWindow):
     def _on_slider_changed(self, value: int) -> None:
         self._brush_size_lbl.setText(str(value))
         self.canvas.set_brush_size(value)
-
-    def _sync_slider(self, size: int) -> None:
-        """Sync slider when brush size changed via [ / ] keys on canvas."""
-        self._brush_slider.blockSignals(True)
-        self._brush_slider.setValue(size)
-        self._brush_slider.blockSignals(False)
-        self._brush_size_lbl.setText(str(size))
 
     # ── canvas signal handlers ────────────────────────────────────────────────
 
