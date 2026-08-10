@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
         # label list never sees the keystroke.
         self._act_label_del = QAction(self, shortcut="Delete")
         self._act_label_merge = QAction(self, shortcut="Home")
+        self._act_contours = QAction(self, shortcut="X")
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
         self.addAction(self._act_pan_toggle)
@@ -555,6 +556,7 @@ class MainWindow(QMainWindow):
         self.addAction(self._act_label_next)
         self.addAction(self._act_label_del)
         self.addAction(self._act_label_merge)
+        self.addAction(self._act_contours)
 
         # Status bar
         sb = QStatusBar(self)
@@ -599,6 +601,7 @@ class MainWindow(QMainWindow):
         self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
         self._act_label_del.triggered.connect(self._clear_active_label)
         self._act_label_merge.triggered.connect(self._merge_selected_labels)
+        self._act_contours.triggered.connect(self._toggle_contours)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
 
@@ -1570,6 +1573,13 @@ class MainWindow(QMainWindow):
         self._act_faint.setChecked(level != 0)
         self._lbl_status.setText(
             f"레이블 투명도: {self._FAINT_NAMES[level]}  ({level + 1}/3)")
+
+    def _toggle_contours(self) -> None:
+        """X: show/hide the outline dots without changing the selection."""
+        visible = not self.canvas.contours_visible
+        self.canvas.set_contours_visible(visible)
+        self._lbl_status.setText(
+            f"레이블 외곽선: {'표시' if visible else '숨김'}")
 
     def _toggle_gamma(self) -> None:
         self.canvas.set_gamma_enabled(self._act_gamma.isChecked())

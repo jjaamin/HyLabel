@@ -3,6 +3,7 @@ import math
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
@@ -90,6 +91,11 @@ class _PointsItem(QGraphicsItem):
     single pass, sized in device pixels so they stay constant on screen.
     """
 
+    # Dot diameter tracks the zoom (radius_px is the size at 1:1), clamped so it
+    # neither vanishes when zoomed out nor swallows the image when zoomed in.
+    MIN_DOT_PX = 2.0
+    MAX_DOT_PX = 14.0
+
     def __init__(self, radius_px: float, color: QColor, z: int) -> None:
         super().__init__()
         self._contours: List[List[Tuple[float, float]]] = []
@@ -149,20 +155,61 @@ class _PointsItem(QGraphicsItem):
         if not self._polys:
             return
         # A round-capped cosmetic pen draws each point as a dot whose diameter
-        # is the pen width in *device* pixels — constant on screen, and the
-        # whole contour goes out in one C++ call. Iterating points in Python to
-        # drawEllipse() each one costs ~5us apiece, which at full contour
-        # density is tens of ms per frame.
-        pen = QPen(self._color, self._radius_px * 2.0)
+        # is the pen width in *device* pixels, and the whole contour goes out in
+        # one C++ call. Iterating points in Python to drawEllipse() each one
+        # costs ~5us apiece, which at full contour density is tens of ms/frame.
+        #
+        # The pen stays cosmetic even though the dots grow with zoom: switching
+        # to a scene-unit pen makes Qt stroke every point individually, which
+        # measured 39ms/frame against 20ms here, and it loses the culling win at
+        # high zoom. Scaling the width instead keeps the fast path.
+        scale = abs(painter.transform().m11()) or 1.0
+        width = min(self.MAX_DOT_PX,
+                    max(self.MIN_DOT_PX, self._radius_px * 2.0 * scale))
+        pen = QPen(self._color, width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        scale = abs(painter.transform().m11()) or 1.0
-        pad = self._radius_px / scale
+        pad = width / scale
         exposed = option.exposedRect.adjusted(-pad, -pad, pad, pad)
         for poly, brect in zip(self._polys, self._brects):
             if exposed.intersects(brect):
                 painter.drawPoints(poly)
+
+
+def _disc_footprint_path(radius: int) -> QPainterPath:
+    """Outline of exactly the pixels cv2.circle() fills at this radius.
+
+    The old cursor was a smooth ellipse, which sits half a pixel off the
+    staircase the brush actually paints — fine for a rough stroke, useless when
+    placing a boundary pixel. This traces the real filled/empty edges instead,
+    so the preview is the result.
+
+    Returned centred on (0, 0) in scene units, so the caller only has to
+    setPos() the snapped pixel centre as the mouse moves. Cheap enough to build
+    on every brush-size change (0.2ms at the maximum radius) and free after.
+    """
+    n = 2 * radius + 3
+    disc = np.zeros((n, n), np.uint8)
+    cv2.circle(disc, (radius + 1, radius + 1), radius, 1, -1)
+    filled = np.pad(disc.astype(bool), 1)
+
+    path = QPainterPath()
+    # A cell boundary exists wherever a filled pixel meets an empty one. Pixel
+    # (px, py) spans scene [px, px+1), so edge coordinates are already integral.
+    off = radius + 2          # padding (1) + circle centre offset (radius + 1)
+
+    horiz = filled[1:, :] != filled[:-1, :]
+    for y, x in zip(*np.nonzero(horiz)):
+        path.moveTo(x - off, y + 1 - off)
+        path.lineTo(x + 1 - off, y + 1 - off)
+
+    vert = filled[:, 1:] != filled[:, :-1]
+    for y, x in zip(*np.nonzero(vert)):
+        path.moveTo(x + 1 - off, y - off)
+        path.lineTo(x + 1 - off, y + 1 - off)
+
+    return path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,7 +252,7 @@ class ImageCanvas(QGraphicsView):
 
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._overlay_item: Optional[_MaskOverlayItem] = None
-        self._brush_ring: Optional[QGraphicsEllipseItem] = None
+        self._brush_ring: Optional[QGraphicsPathItem] = None
 
         self._mask_manager: Optional[MaskManager] = None
         self._cat_colors: Dict[int, Tuple[int, int, int]] = {}
@@ -223,6 +270,7 @@ class ImageCanvas(QGraphicsView):
         self._cp_dots: Optional[_PointsItem] = None
         self._dragging_cp: Tuple[int, int] = (-1, -1)
         self._class_dots: Optional[_PointsItem] = None  # read-only class overview
+        self._contours_visible: bool = True   # toggled by X
 
         self._mode = Mode.IDLE
         self._active_cat_id: int = -1
@@ -257,6 +305,18 @@ class ImageCanvas(QGraphicsView):
     @property
     def faint_level(self) -> int:
         return self._faint_level
+
+    @property
+    def contours_visible(self) -> bool:
+        return self._contours_visible
+
+    def set_contours_visible(self, visible: bool) -> None:
+        """Show or hide every outline dot layer (X). Hidden costs nothing to
+        paint, so this doubles as a way to speed up a dense image."""
+        self._contours_visible = visible
+        for item in (self._cp_dots, self._class_dots):
+            if item is not None:
+                item.setVisible(visible)
 
     def set_faint_level(self, level: int) -> None:
         """Select an overlay opacity from FAINT_LEVELS. Wraps, so callers can
@@ -363,12 +423,15 @@ class ImageCanvas(QGraphicsView):
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)
         scene.addItem(self._contour_overlay)
 
-        self._brush_ring = QGraphicsEllipseItem()
+        self._brush_ring = QGraphicsPathItem()
         self._brush_ring.setZValue(100)
-        self._brush_ring.setPen(QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.DashLine))
+        ring_pen = QPen(Qt.GlobalColor.white, 1.2)
+        ring_pen.setCosmetic(True)          # stays legible at any zoom
+        self._brush_ring.setPen(ring_pen)
         self._brush_ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self._brush_ring.hide()
         scene.addItem(self._brush_ring)
+        self._brush_fp_radius = -1          # radius the cached path was built for
 
         self._mask_manager = None
         return w, h
@@ -735,6 +798,7 @@ class ImageCanvas(QGraphicsView):
         # Control point dots at pixel centres (cp_pts already have +0.5)
         r, color = self._cp_dot_style()
         self._cp_dots = _PointsItem(r, color, z=35)
+        self._cp_dots.setVisible(self._contours_visible)
         self.scene().addItem(self._cp_dots)
         self._cp_dots.set_contours(contours)
 
@@ -768,6 +832,7 @@ class ImageCanvas(QGraphicsView):
         if not contours:
             return
         self._class_dots = _PointsItem(3.0, QColor(255, 255, 255, 220), z=30)
+        self._class_dots.setVisible(self._contours_visible)
         self.scene().addItem(self._class_dots)
         self._class_dots.set_contours(contours)
 
@@ -1042,7 +1107,13 @@ class ImageCanvas(QGraphicsView):
         if self._brush_ring is None:
             return
         r = self._brush_size
-        self._brush_ring.setRect(sp.x() - r, sp.y() - r, 2 * r, 2 * r)
+        if r != self._brush_fp_radius:
+            # Shape only depends on the radius, so rebuild it just on resize.
+            self._brush_ring.setPath(_disc_footprint_path(r))
+            self._brush_fp_radius = r
+        # Snap to the same pixel _do_paint() will use, or the preview would sit
+        # up to half a pixel away from what actually gets painted.
+        self._brush_ring.setPos(int(round(sp.x())), int(round(sp.y())))
         self._brush_ring.show()
 
     # ── helpers ───────────────────────────────────────────────────────────────
