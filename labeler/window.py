@@ -166,6 +166,33 @@ def _polygon_icon(size: int = 21) -> QIcon:
     return QIcon(pm)
 
 
+def _lasso_icon(size: int = 21) -> QIcon:
+    """A freehand loop, closed — the polygon icon's curved counterpart."""
+    from PyQt6.QtGui import QPainterPath
+
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = float(size)
+
+    path = QPainterPath()
+    path.moveTo(s * 0.50, s * 0.10)
+    path.cubicTo(s * 0.92, s * 0.10, s * 1.00, s * 0.52, s * 0.76, s * 0.74)
+    path.cubicTo(s * 0.55, s * 0.94, s * 0.14, s * 0.90, s * 0.08, s * 0.58)
+    path.cubicTo(s * 0.03, s * 0.30, s * 0.22, s * 0.10, s * 0.50, s * 0.10)
+
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#d8e8f8"))
+    p.drawPath(path)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor("#404040"), max(1.0, s * 0.10)))
+    p.drawPath(path)
+
+    p.end()
+    return QIcon(pm)
+
+
 def _json_doc_icon(size: int = 14) -> QIcon:
     from PyQt6.QtGui import QPainterPath as _Path
     pm = QPixmap(size, size)
@@ -365,9 +392,10 @@ class MainWindow(QMainWindow):
         """)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
 
-        # Tool group (exclusive): Select / Draw / Brush / Magic / Pan
+        # Tool group (exclusive): Select / Draw / Lasso / Brush / Magic / Pan
         self._act_select = QAction(self, shortcut="A", checkable=True)
         self._act_draw  = QAction(self, shortcut="D", checkable=True)
+        self._act_lasso = QAction(self, shortcut="L", checkable=True)
         self._act_brush = QAction(self, shortcut="B", checkable=True)
         self._act_magic = QAction(self, shortcut="M", checkable=True)
         self._act_hand  = QAction(self, checkable=True)
@@ -379,6 +407,10 @@ class MainWindow(QMainWindow):
         )
         self._act_draw.setIcon(_polygon_icon())
         self._act_draw.setToolTip("Draw Polygon  (D)")
+        self._act_lasso.setIcon(_lasso_icon())
+        self._act_lasso.setToolTip(
+            "Lasso  (L)  —  drag to trace an outline, released shape is filled\n"
+            "Straight slider sets the shortest segment it will lay down")
         self._act_brush.setIcon(_text_icon("🖌", size=21))
         self._act_brush.setToolTip("Brush  (B)  —  LMB: paint  /  RMB: erase")
         self._act_magic.setIcon(_magic_wand_icon())
@@ -396,7 +428,8 @@ class MainWindow(QMainWindow):
 
         tool_group = QActionGroup(self)
         tool_group.setExclusive(True)
-        for a in (self._act_select, self._act_draw, self._act_brush, self._act_magic):
+        for a in (self._act_select, self._act_draw, self._act_lasso,
+                  self._act_brush, self._act_magic):
             tool_group.addAction(a)
             tb.addAction(a)
 
@@ -442,6 +475,28 @@ class MainWindow(QMainWindow):
         self._brush_size_lbl.setFixedWidth(30)
         sh.addWidget(self._brush_size_lbl)
         rv.addWidget(size_widget)
+
+        # Lasso straightness row
+        straight_widget = QWidget()
+        st = QHBoxLayout(straight_widget)
+        st.setContentsMargins(4, 2, 4, 2)
+        straight_lbl = QLabel("Straight:")
+        straight_lbl.setStyleSheet("font-size: 13px;")
+        st.addWidget(straight_lbl)
+        self._straight_slider = QSlider(Qt.Orientation.Horizontal)
+        self._straight_slider.setRange(0, 20)
+        self._straight_slider.setValue(0)
+        self._straight_slider.setFixedHeight(24)
+        self._straight_slider.setToolTip(
+            "Lasso: shortest segment, in image pixels.\n"
+            "0 follows the cursor freely; higher values hold a straight line\n"
+            "over that distance, so hand tremor does not reach the outline.")
+        st.addWidget(self._straight_slider)
+        self._straight_lbl = QLabel("0 px")
+        self._straight_lbl.setStyleSheet("font-size: 13px;")
+        self._straight_lbl.setFixedWidth(38)
+        st.addWidget(self._straight_lbl)
+        rv.addWidget(straight_widget)
 
         # Model row (AI Magic Wand)
         model_widget = QWidget()
@@ -580,6 +635,7 @@ class MainWindow(QMainWindow):
         self._act_select.toggled.connect(self._on_tool_toggled)
         self._act_hand.toggled.connect(self._on_tool_toggled)
         self._act_draw.toggled.connect(self._on_tool_toggled)
+        self._act_lasso.toggled.connect(self._on_tool_toggled)
         self._act_brush.toggled.connect(self._on_tool_toggled)
         self._act_magic.toggled.connect(self._on_tool_toggled)
         self._act_zoom_in.triggered.connect(lambda: self.canvas.zoom_by(1.2))
@@ -590,6 +646,7 @@ class MainWindow(QMainWindow):
         self._act_gamma_curve.triggered.connect(self._open_gamma_dialog)
 
         self._brush_slider.valueChanged.connect(self._on_slider_changed)
+        self._straight_slider.valueChanged.connect(self._on_straight_changed)
         self.canvas.brush_size_step.connect(self._adjust_size)
         self._act_brush_dec.triggered.connect(lambda: self._adjust_size(-1))
         self._act_brush_inc.triggered.connect(lambda: self._adjust_size(+1))
@@ -1057,6 +1114,10 @@ class MainWindow(QMainWindow):
             self._pre_pan_action = self._act_draw
             self._update_active_class()
             self.canvas.set_mode(Mode.DRAW)
+        elif action is self._act_lasso:
+            self._pre_pan_action = self._act_lasso
+            self._update_active_class()
+            self.canvas.set_mode(Mode.LASSO)
         elif action is self._act_brush:
             self._pre_pan_action = self._act_brush
             self._update_active_class()
@@ -1084,7 +1145,7 @@ class MainWindow(QMainWindow):
 
     def _uncheck_all_tools(self) -> None:
         for a in (self._act_select, self._act_hand, self._act_draw,
-                  self._act_brush, self._act_magic):
+                  self._act_lasso, self._act_brush, self._act_magic):
             a.blockSignals(True)
             a.setChecked(False)
             a.blockSignals(False)
@@ -1125,6 +1186,10 @@ class MainWindow(QMainWindow):
     def _on_slider_changed(self, value: int) -> None:
         self._brush_size_lbl.setText(str(value))
         self.canvas.set_brush_size(value)
+
+    def _on_straight_changed(self, value: int) -> None:
+        self._straight_lbl.setText(f"{value} px")
+        self.canvas.set_lasso_straight(value)
 
     # ── canvas signal handlers ────────────────────────────────────────────────
 
@@ -1448,6 +1513,7 @@ class MainWindow(QMainWindow):
             "select": "Mode: Select  (click a label  /  Ctrl+click for several  /  drag points to edit)",
             "pan":   "Mode: Pan  (drag to move image)",
             "draw":  "Mode: Draw  (double-click or snap to close)",
+            "lasso": "Mode: Lasso  (drag to trace an outline  /  Enter: commit  /  Esc: cancel)",
             "brush": "Mode: Brush  (LMB: paint  /  RMB: erase)",
             "magic": "Mode: AI Magic Wand  (LMB: include  /  RMB: exclude  /  Enter: commit  /  Esc: reset)",
         }

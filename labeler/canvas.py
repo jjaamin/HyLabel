@@ -18,6 +18,7 @@ from .mask_manager import MaskManager
 
 SNAP_DIST = 14      # view-space pixels for polygon first-point snap
 CP_SNAP   = 12      # view-space pixels for control-point grab
+LASSO_SNAP_DIST = 5  # view-space pixels for lasso magnetic start-point snap
 
 # Mask overlay opacity per faint level, cycled by the V key. Level 0 is the
 # normal labelling view; the rest fade the overlay so the image underneath can
@@ -31,6 +32,7 @@ class Mode(Enum):
     SELECT = auto()
     PAN    = auto()
     DRAW   = auto()
+    LASSO  = auto()
     BRUSH  = auto()
     MAGIC  = auto()
 
@@ -93,7 +95,7 @@ class _PointsItem(QGraphicsItem):
 
     # Dot diameter tracks the zoom (radius_px is the size at 1:1), clamped so it
     # neither vanishes when zoomed out nor swallows the image when zoomed in.
-    MIN_DOT_PX = 2.0
+    MIN_DOT_PX = 1.0
     MAX_DOT_PX = 14.0
 
     def __init__(self, radius_px: float, color: QColor, z: int) -> None:
@@ -175,6 +177,13 @@ class _PointsItem(QGraphicsItem):
         for poly, brect in zip(self._polys, self._brects):
             if exposed.intersects(brect):
                 painter.drawPoints(poly)
+
+
+def _solid_rgba(mask: np.ndarray, color: Tuple[int, int, int]) -> np.ndarray:
+    """RGBA where mask>0 is opaque `color`, elsewhere fully transparent."""
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    rgba[mask > 0] = (*color, 255)
+    return rgba
 
 
 def _disc_footprint_path(radius: int) -> QPainterPath:
@@ -265,9 +274,10 @@ class ImageCanvas(QGraphicsView):
         # annotation edit state
         self._edit_ann_id: int = -1
         self._edit_mask: Optional[np.ndarray] = None
+        self._edit_cat_id: int = -1
 
         # contour / control points
-        self._contour_overlay: Optional[_MaskOverlayItem] = None  # pixel boundary
+        self._contour_overlay: Optional[_MaskOverlayItem] = None  # brush opaque preview
         self._cp_contours: List[List[Tuple[float, float]]] = []
         self._cp_arrays: List[np.ndarray] = []   # same data, (n,2) float for hit-test
         self._cp_path_items: List[QGraphicsPathItem] = []   # drag preview only
@@ -285,6 +295,15 @@ class ImageCanvas(QGraphicsView):
         # polygon draft
         self._draft_pts: list = []
         self._draft_path: Optional[QGraphicsPathItem] = None
+
+        # Lasso: freehand outline, filled on release
+        self._lasso_pts: List[QPointF] = []
+        self._lasso_item: Optional[QGraphicsPathItem] = None
+        self._lasso_rubber: Optional[QGraphicsPathItem] = None
+        self._lasso_start_dot: Optional[QGraphicsEllipseItem] = None
+        self._lasso_path = QPainterPath()
+        self._lasso_drawing = False
+        self._lasso_straight = 0.0   # min scene px between vertices; 0 = free
         self._draft_line: Optional[QGraphicsLineItem] = None
         self._draft_dot: Optional[QGraphicsEllipseItem] = None
         self._pending_polygons: Optional[List[List[List[float]]]] = None
@@ -387,6 +406,7 @@ class ImageCanvas(QGraphicsView):
                 MaskManager.compute_bbox(mask))
             self._pending_mask[:] = mask
             self._refresh_overlay_rect(rect)
+            self._sync_edit_overlay()
 
     def refresh_edit_contour(self) -> None:
         """Refresh control-point dots after an external mask change (undo)."""
@@ -397,10 +417,12 @@ class ImageCanvas(QGraphicsView):
 
     def load_image(self, path: str) -> Tuple[int, int]:
         self._cancel_draw()
+        self._cancel_lasso()
         self._painting = False
         self._pending_mask = None
         self._edit_ann_id = -1
         self._edit_mask = None
+        self._edit_cat_id = -1
         self._clear_contour()
         self.clear_class_contours()
 
@@ -448,6 +470,7 @@ class ImageCanvas(QGraphicsView):
         self._cat_colors = cat_colors
         self._edit_ann_id = -1
         self._edit_mask = None
+        self._edit_cat_id = -1
         self._pending_polygons = None
         self._clear_contour()
         self.clear_class_contours()
@@ -467,6 +490,7 @@ class ImageCanvas(QGraphicsView):
     def update_cat_colors(self, cat_colors: Dict[int, Tuple[int, int, int]]) -> None:
         self._cat_colors = cat_colors
         self._refresh_overlay_full()
+        self._sync_edit_overlay()
 
     def refresh_overlay(self, rect: Optional[Tuple[int, int, int, int]] = None) -> None:
         """Repaint the mask overlay. Pass the affected (x1,y1,x2,y2) when known —
@@ -478,12 +502,15 @@ class ImageCanvas(QGraphicsView):
 
     def set_active_category(self, cat_id: int) -> None:
         self._active_cat_id = cat_id
+        self._sync_edit_overlay()
 
     def set_mode(self, mode: Mode) -> None:
         if mode == self._mode:
             return
         if self._mode == Mode.DRAW:
             self._cancel_draw()
+        if self._mode == Mode.LASSO:
+            self._cancel_lasso()
         if self._mode == Mode.MAGIC and mode != Mode.MAGIC:
             self.clear_magic(keep_pending=False)
         self._mode = mode
@@ -496,6 +523,7 @@ class ImageCanvas(QGraphicsView):
         # Update control point dot appearance on mode change
         if self._edit_ann_id >= 0 and self._cp_dots is not None:
             self._cp_dots.set_style(*self._cp_dot_style())
+        self._sync_edit_overlay()
         self.mode_changed.emit(mode.name.lower())
 
     def set_brush_size(self, size: int) -> None:
@@ -561,6 +589,10 @@ class ImageCanvas(QGraphicsView):
         self.clear_class_contours()
         self._edit_ann_id = ann_id
         self._edit_mask = mask
+        # Cached rather than looked up per brush stroke: get_annotation() is a
+        # linear scan, and _do_paint() runs it on every mouse move otherwise.
+        ann = self._mask_manager.get_annotation(ann_id) if self._mask_manager else None
+        self._edit_cat_id = ann.cat_id if ann is not None else -1
         self._show_contour()
 
     def clear_edit_annotation(self) -> None:
@@ -568,7 +600,9 @@ class ImageCanvas(QGraphicsView):
             return
         self._edit_ann_id = -1
         self._edit_mask = None
+        self._edit_cat_id = -1
         self._clear_contour()
+        self._sync_edit_overlay()
         self.edit_cleared.emit()
 
     @property
@@ -593,6 +627,13 @@ class ImageCanvas(QGraphicsView):
                 self._draw_click(self.mapToScene(event.position().toPoint()))
             elif event.button() == Qt.MouseButton.RightButton:
                 self._cancel_draw()
+            return
+
+        if self._mode == Mode.LASSO:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._start_lasso(self.mapToScene(event.position().toPoint()))
+            elif event.button() == Qt.MouseButton.RightButton:
+                self._cancel_lasso()
             return
 
         if self._mode == Mode.MAGIC:
@@ -683,6 +724,10 @@ class ImageCanvas(QGraphicsView):
                 self._draft_dot.setBrush(
                     QBrush(QColor("#FFFF00")) if near else QBrush(Qt.BrushStyle.NoBrush))
 
+        if self._mode == Mode.LASSO and self._lasso_drawing:
+            alt_held = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            self._extend_lasso(sp, magnetic=not alt_held)
+
         if self._mode == Mode.BRUSH:
             self._move_brush_ring(sp)
             if self._painting:
@@ -710,6 +755,11 @@ class ImageCanvas(QGraphicsView):
             self._dragging_cp = (-1, -1)
             self._commit_contour_edit()
             self._show_contour()  # restores pixel boundary, hides drag polygon
+            return
+
+        if self._mode == Mode.LASSO:
+            if self._lasso_drawing and event.button() == Qt.MouseButton.LeftButton:
+                self._complete_lasso()
             return
 
         if self._mode == Mode.BRUSH:
@@ -758,6 +808,8 @@ class ImageCanvas(QGraphicsView):
                 return
             if self._mode == Mode.DRAW:
                 self._cancel_draw()
+            if self._mode == Mode.LASSO:
+                self._cancel_lasso()
             if self._mode == Mode.MAGIC:
                 self.clear_magic(keep_pending=False)
             self._discard_pending()
@@ -830,6 +882,7 @@ class ImageCanvas(QGraphicsView):
     def _show_contour(self) -> None:
         """Pixel-perfect boundary overlay + draggable control point dots."""
         self._clear_contour()
+        self._sync_edit_overlay()
         if self._edit_mask is None or self._contour_overlay is None:
             return
 
@@ -867,6 +920,43 @@ class ImageCanvas(QGraphicsView):
         if self._mode == Mode.BRUSH:
             return 4.0, QColor(255, 255, 0, 110)
         return 3.0, QColor("#FFFF00")
+
+    # ── brush opaque preview ─────────────────────────────────────────────────
+    #
+    # _overlay_item's opacity is one global slider (V / faint level), which can
+    # be low enough that a brush stroke's exact extent is hard to judge while
+    # painting. _contour_overlay sits idle the rest of the time, so it is
+    # repurposed here to show whatever mask the brush is currently touching —
+    # the annotation being edited, or a not-yet-committed pending shape — in
+    # its class color at full opacity, regardless of the faint level.
+
+    def _edit_brush_target(self) -> Tuple[Optional[np.ndarray], Tuple[int, int, int]]:
+        """Mask the opaque preview should track right now, and its color.
+
+        None when nothing qualifies (not in Brush mode, or nothing to paint).
+        """
+        if self._mode != Mode.BRUSH:
+            return None, (0, 0, 0)
+        if self._edit_ann_id >= 0 and self._edit_mask is not None:
+            return self._edit_mask, self._cat_colors.get(self._edit_cat_id, (255, 255, 0))
+        if self._pending_mask is not None and self._active_cat_id >= 0:
+            return self._pending_mask, self._cat_colors.get(self._active_cat_id, (255, 255, 0))
+        return None, (0, 0, 0)
+
+    def _sync_edit_overlay(self) -> None:
+        """Full rebuild of the brush opaque-preview layer.
+
+        For tool/mode switches, undo, and stroke end — an infrequent enough
+        event that rebuilding the whole array is fine. _do_paint() keeps it
+        live mid-stroke with a much cheaper per-region update instead.
+        """
+        if self._contour_overlay is None:
+            return
+        mask, color = self._edit_brush_target()
+        if mask is None:
+            self._contour_overlay.clear()
+            return
+        self._contour_overlay.fill_all(_solid_rgba(mask, color))
 
     def _clear_contour(self) -> None:
         if self._contour_overlay is not None:
@@ -1026,6 +1116,8 @@ class ImageCanvas(QGraphicsView):
             self._pending_polygons = None
         self._pending_mask[:] = 0
         self._refresh_overlay_rect(rect)
+        if self._contour_overlay is not None:
+            self._contour_overlay.clear()
         self.annotation_committed.emit(ann_id)
 
     def _discard_pending(self) -> None:
@@ -1034,6 +1126,8 @@ class ImageCanvas(QGraphicsView):
             rect = MaskManager.compute_bbox(self._pending_mask)
             self._pending_mask[:] = 0
             self._refresh_overlay_rect(rect)
+            if self._contour_overlay is not None:
+                self._contour_overlay.clear()
 
     def _edit_polygons_snapshot(self) -> Optional[List]:
         """Deep copy of the edited annotation's polygon, for the undo stack.
@@ -1111,6 +1205,111 @@ class ImageCanvas(QGraphicsView):
         self._draft_pts.clear()
         self._clear_draft()
 
+    # ── lasso ─────────────────────────────────────────────────────────────────
+
+    def set_lasso_straight(self, px: float) -> None:
+        """Shortest segment the lasso will lay down, in image pixels.
+
+        Image pixels rather than screen pixels: the setting then describes the
+        label geometry itself, so the same value produces the same outline
+        whatever the zoom. 0 disables it and the outline follows the cursor
+        exactly, like a brush.
+        """
+        self._lasso_straight = max(0.0, float(px))
+
+    def _start_lasso(self, sp: QPointF) -> None:
+        self._cancel_lasso()
+        self._lasso_drawing = True
+        self._lasso_pts = [sp]
+        pen = QPen(QColor("#FFFF00"), 2)
+        pen.setCosmetic(True)
+        # Keep the path here rather than reading it back from the item:
+        # addPath() drops a path holding nothing but a moveTo, and the next
+        # lineTo on the emptied path picks up an implicit moveTo(0, 0), which
+        # draws the outline from the scene origin.
+        self._lasso_path = QPainterPath()
+        self._lasso_path.moveTo(sp)
+        self._lasso_item = self.scene().addPath(
+            self._lasso_path, pen, QBrush(Qt.BrushStyle.NoBrush))
+        self._lasso_item.setZValue(20)
+        rubber = QPen(QColor("#FFFF00"), 1, Qt.PenStyle.DashLine)
+        rubber.setCosmetic(True)
+        self._lasso_rubber = self.scene().addPath(
+            QPainterPath(), rubber, QBrush(Qt.BrushStyle.NoBrush))
+        self._lasso_rubber.setZValue(21)
+        # Start-point marker, same color as the outline. ItemIgnoresTransformations
+        # (as the magic-wand include/exclude dots use) keeps it a fixed screen
+        # size, matching the view-space snap radius it represents.
+        self._lasso_start_dot = QGraphicsEllipseItem(
+            -LASSO_SNAP_DIST, -LASSO_SNAP_DIST,
+            LASSO_SNAP_DIST * 2, LASSO_SNAP_DIST * 2)
+        self._lasso_start_dot.setPen(QPen(QColor("#FFFF00"), 2))
+        self._lasso_start_dot.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._lasso_start_dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self._lasso_start_dot.setPos(sp)
+        self._lasso_start_dot.setZValue(22)
+        self.scene().addItem(self._lasso_start_dot)
+
+    def _extend_lasso(self, sp: QPointF, magnetic: bool = True) -> None:
+        """Take the cursor position, but only as a new vertex once it is far
+        enough from the last one — that gap is what stays perfectly straight.
+
+        magnetic=True (Alt not held) snaps the effective position to the
+        start point once the cursor is within LASSO_SNAP_DIST of it, so the
+        outline closes exactly rather than leaving a hairline gap. Alt bypasses
+        this for a start point the user genuinely wants to draw near.
+        """
+        if not self._lasso_drawing or self._lasso_item is None:
+            return
+        near_start = (magnetic and len(self._lasso_pts) >= 2
+                     and self._view_dist(sp, self._lasso_pts[0]) < LASSO_SNAP_DIST)
+        eff = self._lasso_pts[0] if near_start else sp
+        last = self._lasso_pts[-1]
+        d = math.hypot(eff.x() - last.x(), eff.y() - last.y())
+        if d > 0.0 and d >= self._lasso_straight:
+            self._lasso_pts.append(eff)
+            self._lasso_path.lineTo(eff)
+            self._lasso_item.setPath(self._lasso_path)
+        # The rubber band shows where the cursor is even while the outline is
+        # holding its line, so a large setting does not look like a freeze.
+        if self._lasso_rubber is not None:
+            tip = QPainterPath()
+            tip.moveTo(self._lasso_pts[-1])
+            tip.lineTo(eff)
+            tip.lineTo(self._lasso_pts[0])
+            self._lasso_rubber.setPath(tip)
+        if self._lasso_start_dot is not None:
+            self._lasso_start_dot.setBrush(
+                QBrush(QColor("#FFFF00")) if near_start else QBrush(Qt.BrushStyle.NoBrush))
+
+    def _complete_lasso(self) -> None:
+        """Close the outline and fill it into the pending mask (Enter commits)."""
+        pts = [(p.x(), p.y()) for p in self._lasso_pts]
+        self._cancel_lasso()
+        if self._active_cat_id < 0 or len(pts) < 3:
+            return
+        # Same handoff the polygon tool makes: leaving edit mode here is what
+        # lets the following Enter reach _commit_pending().
+        if self._edit_ann_id >= 0:
+            self.clear_edit_annotation()
+        self._pending_polygons = [[[x, y] for x, y in pts]]
+        if self._mask_manager and self._overlay_item and self._pending_mask is not None:
+            x1, y1, x2, y2 = MaskManager.fill_polygon_on(self._pending_mask, pts)
+            if x2 > x1 and y2 > y1:
+                self._refresh_overlay_region(x1, y1, x2, y2)
+        self.set_mode(Mode.IDLE)
+
+    def _cancel_lasso(self) -> None:
+        self._lasso_drawing = False
+        self._lasso_pts = []
+        self._lasso_path = QPainterPath()
+        for obj in (self._lasso_item, self._lasso_rubber, self._lasso_start_dot):
+            if obj is not None:
+                self.scene().removeItem(obj)
+        self._lasso_item = None
+        self._lasso_rubber = None
+        self._lasso_start_dot = None
+
     def _clear_draft(self) -> None:
         for obj in (self._draft_path, self._draft_line, self._draft_dot):
             if obj is not None:
@@ -1145,6 +1344,10 @@ class ImageCanvas(QGraphicsView):
             if x2 > x1 and y2 > y1:
                 rgba = self._mask_manager.rgba_region(x1, y1, x2, y2, self._cat_colors)
                 self._overlay_item.refresh_region(rgba, x1, y1)
+                if self._contour_overlay is not None:
+                    color = self._cat_colors.get(self._edit_cat_id, (255, 255, 0))
+                    solid = _solid_rgba(self._edit_mask[y1:y2, x1:x2], color)
+                    self._contour_overlay.refresh_region(solid, x1, y1)
             # Brush invalidates polygon precision — must extract from mask on save
             ann = self._mask_manager.get_annotation(self._edit_ann_id)
             if ann is not None:
@@ -1162,6 +1365,10 @@ class ImageCanvas(QGraphicsView):
                 x1, y1, x2, y2 = MaskManager.erase_circle_on(self._pending_mask, ix, iy, r)
             if x2 > x1 and y2 > y1:
                 self._refresh_overlay_region(x1, y1, x2, y2)
+                if self._contour_overlay is not None and self._active_cat_id >= 0:
+                    color = self._cat_colors.get(self._active_cat_id, (255, 255, 0))
+                    solid = _solid_rgba(self._pending_mask[y1:y2, x1:x2], color)
+                    self._contour_overlay.refresh_region(solid, x1, y1)
 
     def _move_brush_ring(self, sp: QPointF) -> None:
         if self._brush_ring is None:
@@ -1181,7 +1388,7 @@ class ImageCanvas(QGraphicsView):
     def _apply_cursor(self) -> None:
         if self._mode == Mode.BRUSH:
             self.setCursor(Qt.CursorShape.BlankCursor)
-        elif self._mode in (Mode.DRAW, Mode.MAGIC):
+        elif self._mode in (Mode.DRAW, Mode.LASSO, Mode.MAGIC):
             self.setCursor(Qt.CursorShape.CrossCursor)
             if self._brush_ring:
                 self._brush_ring.hide()
