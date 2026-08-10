@@ -457,7 +457,7 @@ class MainWindow(QMainWindow):
         rv.setSpacing(6)
 
         # Brush size row
-        size_widget = QWidget()
+        self._size_widget = size_widget = QWidget()
         sh = QHBoxLayout(size_widget)
         sh.setContentsMargins(4, 2, 4, 2)
         brush_lbl = QLabel("Brush:")
@@ -477,7 +477,7 @@ class MainWindow(QMainWindow):
         rv.addWidget(size_widget)
 
         # Lasso straightness row
-        straight_widget = QWidget()
+        self._straight_widget = straight_widget = QWidget()
         st = QHBoxLayout(straight_widget)
         st.setContentsMargins(4, 2, 4, 2)
         straight_lbl = QLabel("Straight:")
@@ -490,7 +490,8 @@ class MainWindow(QMainWindow):
         self._straight_slider.setToolTip(
             "Lasso: shortest segment, in image pixels.\n"
             "0 follows the cursor freely; higher values hold a straight line\n"
-            "over that distance, so hand tremor does not reach the outline.")
+            "over that distance, so hand tremor does not reach the outline.\n"
+            "( [ / ] or Shift + mouse wheel )")
         st.addWidget(self._straight_slider)
         self._straight_lbl = QLabel("0 px")
         self._straight_lbl.setStyleSheet("font-size: 13px;")
@@ -499,7 +500,7 @@ class MainWindow(QMainWindow):
         rv.addWidget(straight_widget)
 
         # Model row (AI Magic Wand)
-        model_widget = QWidget()
+        self._model_widget = model_widget = QWidget()
         mow = QHBoxLayout(model_widget)
         mow.setContentsMargins(4, 2, 4, 2)
         model_lbl = QLabel("AI Model:")
@@ -515,7 +516,7 @@ class MainWindow(QMainWindow):
         rv.addWidget(model_widget)
 
         # Mask index row (AI Magic Wand)
-        mask_widget = QWidget()
+        self._mask_widget = mask_widget = QWidget()
         mh = QHBoxLayout(mask_widget)
         mh.setContentsMargins(4, 2, 4, 2)
         mask_lbl = QLabel("Mask:")
@@ -681,6 +682,7 @@ class MainWindow(QMainWindow):
         self.canvas.edit_changed.connect(self._on_edit_changed)
         self.canvas.edit_cleared.connect(self._on_edit_cleared)
         self.canvas.mode_changed.connect(self._on_mode_changed)
+        self._update_tool_panel(self.canvas.current_mode)
         # itemSelectionChanged, not currentRowChanged: with several rows picked
         # the current row alone does not describe the selection.
         self._label_list.itemSelectionChanged.connect(self._on_label_selection_changed)
@@ -1176,8 +1178,11 @@ class MainWindow(QMainWindow):
     # ── brush size ────────────────────────────────────────────────────────────
 
     def _adjust_size(self, delta: int) -> None:
-        if self.canvas.current_mode == "magic":
+        mode = self.canvas.current_mode
+        if mode == "magic":
             self._mask_slider.setValue(self._mask_slider.value() + delta)
+        elif mode == "lasso":
+            self._straight_slider.setValue(self._straight_slider.value() + delta)
         else:
             cur = self._brush_slider.value()
             step = 1 if cur <= 30 else (2 if cur <= 60 else 4)
@@ -1520,6 +1525,19 @@ class MainWindow(QMainWindow):
         self._lbl_mode.setText(labels.get(mode_str, f"Mode: {mode_str}"))
         if mode_str == "idle":
             self._uncheck_all_tools()
+        self._update_tool_panel(mode_str)
+
+    def _update_tool_panel(self, mode_str: str) -> None:
+        """Show only the settings that apply to the active tool.
+
+        Brush and Lasso both use size-like sliders that would otherwise sit in
+        the sidebar unused and easy to confuse for one another; the magic-wand
+        model/mask controls are meaningless outside that tool entirely.
+        """
+        self._size_widget.setVisible(mode_str == "brush")
+        self._straight_widget.setVisible(mode_str == "lasso")
+        self._model_widget.setVisible(mode_str == "magic")
+        self._mask_widget.setVisible(mode_str == "magic")
 
     # ── AI magic wand (EdgeSAM / SAM2) ──────────────────────────────────────────
 

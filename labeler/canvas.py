@@ -347,6 +347,13 @@ class ImageCanvas(QGraphicsView):
         self._faint_level = level % len(FAINT_LEVELS)
         if self._overlay_item is not None:
             self._overlay_item.setOpacity(FAINT_LEVELS[self._faint_level])
+        # The brush preview is a separate item so the annotation being edited
+        # reads clearly even where it overlaps others, but it must still track
+        # V — pinning it to always-opaque was a regression: V stopped doing
+        # anything visible while brushing, since this item sat on top at full
+        # opacity regardless of the overlay's level.
+        if self._contour_overlay is not None:
+            self._contour_overlay.setOpacity(FAINT_LEVELS[self._faint_level])
 
     def set_gamma_lut(self, lut: np.ndarray) -> None:
         self._gamma_lut = lut
@@ -449,6 +456,7 @@ class ImageCanvas(QGraphicsView):
 
         self._contour_overlay = _MaskOverlayItem(w, h)
         self._contour_overlay.setZValue(8)   # above mask (5), below draft (20)
+        self._contour_overlay.setOpacity(FAINT_LEVELS[self._faint_level])
         scene.addItem(self._contour_overlay)
 
         self._brush_ring = QGraphicsPathItem()
