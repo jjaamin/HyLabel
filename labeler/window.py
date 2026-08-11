@@ -1178,6 +1178,12 @@ class MainWindow(QMainWindow):
     # ── brush size ────────────────────────────────────────────────────────────
 
     def _adjust_size(self, delta: int) -> None:
+        # Shift+wheel reaches here without ever going through keyPressEvent, so
+        # the shift-alone tap tracker (see keyReleaseEvent) never learns Shift
+        # was combined with something else. Left uncancelled, releasing Shift
+        # right after a wheel-resize reads as a lone tap and jumps to the last
+        # label.
+        self._shift_alone = False
         mode = self.canvas.current_mode
         if mode == "magic":
             self._mask_slider.setValue(self._mask_slider.value() + delta)
