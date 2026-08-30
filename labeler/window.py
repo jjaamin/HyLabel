@@ -644,6 +644,7 @@ class MainWindow(QMainWindow):
         # label list never sees the keystroke.
         self._act_label_del = QAction(self, shortcut="Delete")
         self._act_label_merge = QAction(self, shortcut="Home")
+        self._act_labels_clear = QAction(self, shortcut="Ctrl+Delete")
         self._act_contours = QAction(self, shortcut="X")
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
@@ -656,6 +657,7 @@ class MainWindow(QMainWindow):
         self.addAction(self._act_label_next)
         self.addAction(self._act_label_del)
         self.addAction(self._act_label_merge)
+        self.addAction(self._act_labels_clear)
         self.addAction(self._act_contours)
 
         # Status bar
@@ -704,6 +706,7 @@ class MainWindow(QMainWindow):
         self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
         self._act_label_del.triggered.connect(self._clear_active_label)
         self._act_label_merge.triggered.connect(self._merge_selected_labels)
+        self._act_labels_clear.triggered.connect(self._clear_all_labels)
         self._act_contours.triggered.connect(self._toggle_contours)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
@@ -1088,6 +1091,53 @@ class MainWindow(QMainWindow):
         remaining = self._label_list.count()
         if remaining:
             self._label_list.setCurrentRow(min(row, remaining - 1))
+
+    def _clear_all_labels(self) -> None:
+        """Ctrl+Delete: drop every label on the current image.
+
+        Aimed at the Images list — pick a file, wipe what is on it and start
+        over — but bound window-level like Delete and Home, since selecting an
+        image hands focus to the canvas. One undo step brings all of them back.
+        """
+        if self.current_img_ann is None:
+            return
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            return
+        anns = mgr.annotations()
+        if not anns:
+            self._lbl_status.setText("이 이미지에는 지울 레이블이 없습니다.")
+            return
+
+        name = os.path.basename(self.current_img_ann.file_path)
+        if QMessageBox.question(
+            self, "Delete all labels",
+            f"'{name}' 의 레이블 {len(anns)}개를 모두 지울까요?\n"
+            "Ctrl+Z 로 되돌릴 수 있습니다.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self._push_undo({
+            "type": "anns_deleted",
+            "members": [{
+                "ann_id": a.ann_id,
+                "cat_id": a.cat_id,
+                "mask": a.mask.copy(),
+                "index": mgr.annotation_index(a.ann_id),
+                "polygons": _copy_polygons(a.original_polygons),
+            } for a in anns],
+        })
+
+        self.canvas.clear_edit_annotation()
+        for a in anns:
+            mgr.remove_annotation(a.ann_id)
+        # Every annotation is gone, so a full composite is the cheap option here
+        # rather than unioning what could be hundreds of bboxes.
+        self.canvas.refresh_overlay()
+        self._refresh_labels()
+        self._mark_modified()
+        self._show_class_contours()
+        self._lbl_status.setText(f"레이블 {len(anns)}개를 지웠습니다.")
 
     def _merge_selected_labels(self) -> None:
         """Combine the selected annotations into the first one."""
@@ -1600,6 +1650,32 @@ class MainWindow(QMainWindow):
             self._refresh_labels()
             self._mark_modified()
             return {"type": "ann_added", "ann_id": record["ann_id"]}
+
+        if t == "anns_deleted":
+            # Ascending index order, so each insert lands where it started.
+            for m in sorted(record["members"], key=lambda d: d["index"]):
+                mgr.restore_annotation(m["ann_id"], m["cat_id"], m["mask"],
+                                       m["index"], m["polygons"])
+            self.canvas.refresh_overlay()
+            self._refresh_labels()
+            self._mark_modified()
+            return {"type": "anns_added",
+                    "ann_ids": [m["ann_id"] for m in record["members"]]}
+
+        if t == "anns_added":
+            # Snapshot every one before removing any: annotation_index() shifts
+            # as entries come out, so interleaving the two records wrong indices
+            # and the restore would put them back in a different order.
+            members = _snapshot_anns(mgr, record["ann_ids"])
+            if not members:
+                return None
+            for m in members:
+                mgr.remove_annotation(m["ann_id"])
+            self.canvas.clear_edit_annotation()
+            self.canvas.refresh_overlay()
+            self._refresh_labels()
+            self._mark_modified()
+            return {"type": "anns_deleted", "members": members}
 
         if t == "anns_merged":
             merged = mgr.get_annotation(record["keep_id"])
