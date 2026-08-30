@@ -1844,7 +1844,14 @@ class MainWindow(QMainWindow):
             return
         if not event.isAutoRepeat():
             if event.key() == Qt.Key.Key_Shift:
-                self._shift_alone = True
+                # Shift joining a combo already under way (Ctrl+Shift+S,
+                # Ctrl+Shift+Z) is not a solo tap. The combo's final key never
+                # reaches here — the shortcut consumes it — so the modifiers
+                # held at this moment are the only thing that tells them apart.
+                self._shift_alone = not (event.modifiers() & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier))
             else:
                 self._shift_alone = False
         super().keyPressEvent(event)
