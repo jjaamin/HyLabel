@@ -3,7 +3,6 @@ import math
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
@@ -184,7 +183,7 @@ class _PointsItem(QGraphicsItem):
 
 
 def _disc_footprint_path(radius: int) -> QPainterPath:
-    """Outline of exactly the pixels cv2.circle() fills at this radius.
+    """Outline of exactly the pixels the brush fills at this radius.
 
     The old cursor was a smooth ellipse, which sits half a pixel off the
     staircase the brush actually paints — fine for a rough stroke, useless when
@@ -195,15 +194,13 @@ def _disc_footprint_path(radius: int) -> QPainterPath:
     setPos() the snapped pixel centre as the mouse moves. Cheap enough to build
     on every brush-size change (0.2ms at the maximum radius) and free after.
     """
-    n = 2 * radius + 3
-    disc = np.zeros((n, n), np.uint8)
-    cv2.circle(disc, (radius + 1, radius + 1), radius, 1, -1)
-    filled = np.pad(disc.astype(bool), 1)
+    fp = MaskManager.brush_footprint(radius)
+    filled = np.pad(fp, 1)
 
     path = QPainterPath()
     # A cell boundary exists wherever a filled pixel meets an empty one. Pixel
     # (px, py) spans scene [px, px+1), so edge coordinates are already integral.
-    off = radius + 2          # padding (1) + circle centre offset (radius + 1)
+    off = fp.shape[0] // 2 + 1        # footprint centre + the 1px pad
 
     horiz = filled[1:, :] != filled[:-1, :]
     for y, x in zip(*np.nonzero(horiz)):
@@ -226,19 +223,17 @@ def _disc_fill_path(radius: int) -> QPainterPath:
     networks in one path would additionally stroke every fill rectangle's own
     border, striping the disc with unwanted lines. Kept separate instead.
 
-    A circle's rows are each a single contiguous run of filled pixels, so the
-    exact filled region is just one rectangle per row — cheaper than a full
+    The footprint's rows are each a single contiguous run of filled pixels, so
+    the exact filled region is just one rectangle per row — cheaper than a full
     boundary trace, and unambiguous since it uses the same "pixel (px, py)
     spans scene [px, px+1)" convention directly rather than round-tripping
-    through cv2.findContours' pixel-center points.
+    through contour extraction's pixel-center points.
     """
-    n = 2 * radius + 3
-    disc = np.zeros((n, n), np.uint8)
-    cv2.circle(disc, (radius + 1, radius + 1), radius, 1, -1)
-    off = radius + 1
+    fp = MaskManager.brush_footprint(radius)
+    off = fp.shape[0] // 2
     path = QPainterPath()
-    for y in range(n):
-        xs = np.nonzero(disc[y])[0]
+    for y in range(fp.shape[0]):
+        xs = np.nonzero(fp[y])[0]
         if xs.size == 0:
             continue
         x0, x1 = int(xs[0]), int(xs[-1]) + 1

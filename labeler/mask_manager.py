@@ -4,6 +4,9 @@ import cv2
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Brush footprints keyed by radius — see MaskManager.brush_footprint().
+_FOOTPRINT_CACHE: Dict[int, np.ndarray] = {}
+
 
 @dataclass
 class Annotation:
@@ -163,20 +166,75 @@ class MaskManager:
     # ── static paint helpers (operate on an external numpy mask) ─────────────
 
     @staticmethod
+    def brush_footprint(radius: int) -> np.ndarray:
+        """Pixels the brush covers, as a bool array cropped to its own extent.
+
+        A filled circle ends in a single lone pixel at the top, bottom, left and
+        right — every radius, not just some. Those four spikes are what leaves
+        1px bumps sticking out of a contour after painting along an edge.
+
+        Dropping any row or column that holds just one pixel shaves exactly
+        those four off and leaves a heavily rounded square, which traces an edge
+        cleanly. Small radii have no room to stay round and land on plain
+        squares (r=2 is 3x3, r=3 is 5x5); r=1 becomes a single pixel, which is
+        the useful thing to have at that size anyway.
+
+        Cached per radius: this runs on every brush-size change and the result
+        only depends on the radius.
+        """
+        r = max(1, int(radius))
+        cached = _FOOTPRINT_CACHE.get(r)
+        if cached is not None:
+            return cached
+
+        n = 2 * r + 1
+        disc = np.zeros((n, n), np.uint8)
+        cv2.circle(disc, (r, r), r, 1, -1)
+        f = disc.astype(bool)
+        f[f.sum(axis=1) == 1, :] = False
+        f[:, f.sum(axis=0) == 1] = False
+
+        ys, xs = np.nonzero(f)
+        if ys.size == 0:                     # only possible if r collapsed away
+            f = np.ones((1, 1), dtype=bool)
+        else:
+            f = f[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        f = np.ascontiguousarray(f)
+        _FOOTPRINT_CACHE[r] = f
+        return f
+
+    @staticmethod
+    def _stamp_brush(mask: np.ndarray, cx: int, cy: int, radius: int,
+                     value: int) -> Tuple[int, int, int, int]:
+        """Write value through the brush footprint centred on (cx, cy).
+
+        Returns the touched rect, clipped to the mask, as (x1, y1, x2, y2) with
+        x2/y2 exclusive — empty when the brush misses the image entirely.
+        """
+        fp = MaskManager.brush_footprint(radius)
+        fh, fw = fp.shape
+        h, w = mask.shape
+        x0, y0 = cx - fw // 2, cy - fh // 2
+
+        sx, sy = max(0, -x0), max(0, -y0)
+        dx1, dy1 = max(0, x0), max(0, y0)
+        dx2, dy2 = min(w, x0 + fw), min(h, y0 + fh)
+        if dx2 <= dx1 or dy2 <= dy1:
+            return (0, 0, 0, 0)
+
+        np.copyto(mask[dy1:dy2, dx1:dx2], np.uint8(value),
+                  where=fp[sy:sy + (dy2 - dy1), sx:sx + (dx2 - dx1)])
+        return (dx1, dy1, dx2, dy2)
+
+    @staticmethod
     def paint_circle_on(mask: np.ndarray, cx: int, cy: int,
                         radius: int) -> Tuple[int, int, int, int]:
-        h, w = mask.shape
-        cv2.circle(mask, (cx, cy), radius, 255, -1)
-        return (max(0, cx - radius - 1), max(0, cy - radius - 1),
-                min(w, cx + radius + 2), min(h, cy + radius + 2))
+        return MaskManager._stamp_brush(mask, cx, cy, radius, 255)
 
     @staticmethod
     def erase_circle_on(mask: np.ndarray, cx: int, cy: int,
                         radius: int) -> Tuple[int, int, int, int]:
-        h, w = mask.shape
-        cv2.circle(mask, (cx, cy), radius, 0, -1)
-        return (max(0, cx - radius - 1), max(0, cy - radius - 1),
-                min(w, cx + radius + 2), min(h, cy + radius + 2))
+        return MaskManager._stamp_brush(mask, cx, cy, radius, 0)
 
     @staticmethod
     def fill_polygon_on(mask: np.ndarray,
