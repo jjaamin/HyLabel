@@ -4,7 +4,10 @@ import os
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QEvent, QSize, QSettings, QItemSelectionModel
-from PyQt6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence,
+    QPainter, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
     QLabel, QListWidget, QListWidgetItem, QMainWindow,
@@ -20,6 +23,39 @@ from .gamma_dialog import GammaCurveDialog, compute_lut
 from . import sam_worker
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _snapshot_anns(mgr, ann_ids):
+    """Restorable snapshots of several annotations, in list order.
+
+    Taken in one pass with nothing removed yet: annotation_index() reports a
+    live position, so removing as you go would record indices that have already
+    shifted and the restore would reorder the label list.
+    """
+    out = []
+    for ann_id in ann_ids:
+        a = mgr.get_annotation(ann_id)
+        if a is None:
+            continue
+        out.append({
+            "ann_id": a.ann_id,
+            "cat_id": a.cat_id,
+            "mask": a.mask.copy(),
+            "index": mgr.annotation_index(a.ann_id),
+            "polygons": _copy_polygons(a.original_polygons),
+        })
+    return out
+
+
+def _copy_polygons(polys):
+    """Deep copy of an annotation outline for the history stacks.
+
+    The stacks must not alias the live lists: a later edit would otherwise
+    rewrite the snapshot that is supposed to undo it.
+    """
+    if polys is None:
+        return None
+    return [[[x, y] for x, y in poly] for poly in polys]
 
 
 def _color_icon(hex_color: str, size: int = 14) -> QIcon:
@@ -324,8 +360,9 @@ class MainWindow(QMainWindow):
         # image_id → MaskManager  (in-place modified during editing)
         self._mask_managers: Dict[int, MaskManager] = {}
 
-        # undo stack: list of operation dicts (cleared on image change)
+        # history stacks: operation dicts, both cleared on image change
         self._undo_stack: List[dict] = []
+        self._redo_stack: List[dict] = []
         self._syncing_selection = False
 
         self._build_ui()
@@ -366,6 +403,12 @@ class MainWindow(QMainWindow):
         em = mb.addMenu("&Edit")
         self._act_undo = QAction("&Undo", self, shortcut="Ctrl+Z")
         em.addAction(self._act_undo)
+        self._act_redo = QAction("&Redo", self)
+        # Ctrl+Y is the Windows default; Ctrl+Shift+Z is what people coming
+        # from other editors reach for. Both are accepted.
+        self._act_redo.setShortcuts(
+            [QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        em.addAction(self._act_redo)
 
         # ── Left Vertical Toolbar ─────────────────────────────────────────────
         tb = QToolBar("Tools", self)
@@ -628,6 +671,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self._act_undo.triggered.connect(self._handle_undo)
+        self._act_redo.triggered.connect(self._handle_redo)
         self._act_open_folder.triggered.connect(self._open_folder)
         self._act_open_file.triggered.connect(self._open_file)
         self._act_save.triggered.connect(self._save)
@@ -881,6 +925,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         self._undo_stack.clear()
+        self._redo_stack.clear()
         self._sam_img_path = ""  # force re-encode on next magic click
 
         name = self._img_list.item(row).text()
@@ -1025,9 +1070,7 @@ class MainWindow(QMainWindow):
                 "cat_id": ann.cat_id,
                 "mask": ann.mask.copy(),
                 "index": mgr.annotation_index(ann_id),
-                "polygons": (
-                    [[[x, y] for x, y in p] for p in ann.original_polygons]
-                    if ann.original_polygons is not None else None),
+                "polygons": _copy_polygons(ann.original_polygons),
             })
         self.canvas.clear_edit_annotation()
         mgr.remove_annotation(ann_id)
@@ -1084,9 +1127,7 @@ class MainWindow(QMainWindow):
                 "cat_id": a.cat_id,
                 "mask": a.mask.copy(),
                 "index": mgr.annotation_index(a.ann_id),
-                "polygons": (
-                    [[[x, y] for x, y in p] for p in a.original_polygons]
-                    if a.original_polygons is not None else None),
+                "polygons": _copy_polygons(a.original_polygons),
             } for a in anns],
         })
 
@@ -1433,6 +1474,8 @@ class MainWindow(QMainWindow):
         self._undo_stack.append(record)
         if len(self._undo_stack) > 100:
             self._undo_stack.pop(0)
+        # A new action forks the history: anything undone is no longer reachable.
+        self._redo_stack.clear()
 
     def _handle_undo(self) -> None:
         """Ctrl+Z dispatcher: polygon-point undo is canvas-local, rest via undo stack."""
@@ -1441,57 +1484,111 @@ class MainWindow(QMainWindow):
         else:
             self._do_undo()
 
+    def _handle_redo(self) -> None:
+        """Ctrl+Y dispatcher, mirroring _handle_undo.
+
+        An unfinished polygon is checked first: its vertices live in the canvas
+        rather than on the stacks, so redoing off the stack while one is open
+        would replay some unrelated earlier action instead.
+        """
+        if self.canvas.current_mode == "draw" and (
+                self.canvas.has_undone_draft_points()
+                or self.canvas.has_draft_points()):
+            if not self.canvas.redo_draw_point():
+                self._lbl_status.setText("다시 실행할 꼭짓점이 없습니다.")
+            return
+        self._do_redo()
+
     def _do_undo(self) -> None:
         if not self._undo_stack:
+            self._lbl_status.setText("실행 취소할 작업이 없습니다.")
             return
-        record = self._undo_stack.pop()
+        inverse = self._apply_record(self._undo_stack.pop())
+        if inverse is not None:
+            self._redo_stack.append(inverse)
+            if len(self._redo_stack) > 100:
+                self._redo_stack.pop(0)
+
+    def _do_redo(self) -> None:
+        if not self._redo_stack:
+            self._lbl_status.setText("다시 실행할 작업이 없습니다.")
+            return
+        inverse = self._apply_record(self._redo_stack.pop())
+        if inverse is not None:
+            self._undo_stack.append(inverse)
+            if len(self._undo_stack) > 100:
+                self._undo_stack.pop(0)
+
+    def _apply_record(self, record: dict) -> Optional[dict]:
+        """Apply one history record; return the record that reverses it.
+
+        Undo and redo are the same operation pointed in opposite directions, so
+        both run through here. Whatever a record is about to overwrite gets
+        snapshotted first and handed back for the other stack, which keeps the
+        two directions from drifting apart as record types are added.
+
+        Returns None when the record cannot be applied — a stale annotation id,
+        or no image loaded. The caller then drops it rather than stacking a step
+        that would not come back.
+        """
         t = record["type"]
 
         if t == "pending_brush":
+            prev = self.canvas.pending_mask_copy()
+            if prev is None:
+                return None
             self.canvas.restore_pending_mask(record["mask"])
+            return {"type": "pending_brush", "mask": prev}
 
-        elif t == "edit_stroke":
-            ann_id = record["ann_id"]
-            if self.current_img_ann is None:
-                return
-            mgr = self._mask_managers.get(self.current_img_ann.image_id)
-            if mgr is None:
-                return
-            ann = mgr.get_annotation(ann_id)
-            if ann is not None:
-                old = ann.bbox
-                ann.mask[:] = record["mask"]
-                # Restore the polygon alongside the mask — original_polygons is
-                # what gets saved, so undoing one without the other would leave
-                # the JSON reflecting an edit the user just undid.
-                ann.original_polygons = record.get("polygons")
-                mgr.recompute_bbox(ann_id)   # mask replaced wholesale
-                self.canvas.refresh_overlay(
-                    MaskManager.union_bbox(old, ann.bbox))
-                self.canvas.refresh_edit_contour()
+        if self.current_img_ann is None:
+            return None
+        mgr = self._mask_managers.get(self.current_img_ann.image_id)
+        if mgr is None:
+            return None
+
+        if t == "edit_stroke":
+            ann = mgr.get_annotation(record["ann_id"])
+            if ann is None:
+                return None
+            inverse = {
+                "type": "edit_stroke",
+                "ann_id": ann.ann_id,
+                "mask": ann.mask.copy(),
+                "polygons": _copy_polygons(ann.original_polygons),
+            }
+            old = ann.bbox
+            ann.mask[:] = record["mask"]
+            # Move the polygon with the mask — original_polygons is what gets
+            # saved, so shifting one without the other would leave the JSON
+            # describing a state that is no longer applied.
+            ann.original_polygons = record.get("polygons")
+            mgr.recompute_bbox(ann.ann_id)   # mask replaced wholesale
+            self.canvas.refresh_overlay(MaskManager.union_bbox(old, ann.bbox))
+            self.canvas.refresh_edit_contour()
             self._mark_modified()
+            return inverse
 
-        elif t == "ann_added":
-            ann_id = record["ann_id"]
-            if self.current_img_ann is None:
-                return
-            mgr = self._mask_managers.get(self.current_img_ann.image_id)
-            if mgr is None:
-                return
-            ann = mgr.get_annotation(ann_id)
-            rect = ann.bbox if ann is not None else None
+        if t == "ann_added":
+            ann = mgr.get_annotation(record["ann_id"])
+            if ann is None:
+                return None
+            inverse = {
+                "type": "ann_deleted",
+                "ann_id": ann.ann_id,
+                "cat_id": ann.cat_id,
+                "mask": ann.mask.copy(),
+                "index": mgr.annotation_index(ann.ann_id),
+                "polygons": _copy_polygons(ann.original_polygons),
+            }
+            rect = ann.bbox
             self.canvas.clear_edit_annotation()
-            mgr.remove_annotation(ann_id)
+            mgr.remove_annotation(ann.ann_id)
             self.canvas.refresh_overlay(rect)
             self._refresh_labels()
             self._mark_modified()
+            return inverse
 
-        elif t == "ann_deleted":
-            if self.current_img_ann is None:
-                return
-            mgr = self._mask_managers.get(self.current_img_ann.image_id)
-            if mgr is None:
-                return
+        if t == "ann_deleted":
             mgr.restore_annotation(
                 record["ann_id"], record["cat_id"],
                 record["mask"], record.get("index"),
@@ -1502,16 +1599,25 @@ class MainWindow(QMainWindow):
                 restored.bbox if restored is not None else None)
             self._refresh_labels()
             self._mark_modified()
+            return {"type": "ann_added", "ann_id": record["ann_id"]}
 
-        elif t == "anns_merged":
-            if self.current_img_ann is None:
-                return
-            mgr = self._mask_managers.get(self.current_img_ann.image_id)
-            if mgr is None:
-                return
-            self.canvas.clear_edit_annotation()
+        if t == "anns_merged":
             merged = mgr.get_annotation(record["keep_id"])
-            rect = merged.bbox if merged is not None else None
+            if merged is None:
+                return None
+            inverse = {
+                "type": "anns_unmerged",
+                "keep": {
+                    "ann_id": merged.ann_id,
+                    "cat_id": merged.cat_id,
+                    "mask": merged.mask.copy(),
+                    "index": mgr.annotation_index(merged.ann_id),
+                    "polygons": _copy_polygons(merged.original_polygons),
+                },
+                "member_ids": [m["ann_id"] for m in record["members"]],
+            }
+            self.canvas.clear_edit_annotation()
+            rect = merged.bbox
             mgr.remove_annotation(record["keep_id"])
             # Ascending index order, so each insert lands where it started.
             for m in sorted(record["members"], key=lambda d: d["index"]):
@@ -1522,6 +1628,35 @@ class MainWindow(QMainWindow):
             self.canvas.refresh_overlay(rect)
             self._refresh_labels()
             self._mark_modified()
+            return inverse
+
+        if t == "anns_unmerged":
+            # Redo of a merge: take the members back out and put the combined
+            # annotation back where it was. Snapshot first, remove after — see
+            # the note in the anns_added branch.
+            members = _snapshot_anns(mgr, record["member_ids"])
+            if not members:
+                return None
+            rect = None
+            for m in members:
+                ann = mgr.get_annotation(m["ann_id"])
+                if ann is not None:
+                    rect = MaskManager.union_bbox(rect, ann.bbox)
+                mgr.remove_annotation(m["ann_id"])
+            keep = record["keep"]
+            self.canvas.clear_edit_annotation()
+            mgr.restore_annotation(keep["ann_id"], keep["cat_id"], keep["mask"],
+                                   keep.get("index"), keep.get("polygons"))
+            restored = mgr.get_annotation(keep["ann_id"])
+            rect = MaskManager.union_bbox(
+                rect, restored.bbox if restored is not None else None)
+            self.canvas.refresh_overlay(rect)
+            self._refresh_labels()
+            self._mark_modified()
+            return {"type": "anns_merged",
+                    "keep_id": keep["ann_id"], "members": members}
+
+        return None
 
     def _set_label_bold(self, row: int) -> None:
         for i in range(self._label_list.count()):

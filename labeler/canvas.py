@@ -319,6 +319,8 @@ class ImageCanvas(QGraphicsView):
 
         # polygon draft
         self._draft_pts: list = []
+        # Vertices taken off by Ctrl+Z, waiting for Ctrl+Y to put them back.
+        self._undone_draft_pts: list = []
         self._draft_path: Optional[QGraphicsPathItem] = None
 
         # Lasso: freehand outline, filled on release
@@ -412,14 +414,32 @@ class ImageCanvas(QGraphicsView):
         """Remove the last polygon vertex (called by window on Ctrl+Z in DRAW mode)."""
         if not self._draft_pts:
             return
-        self._draft_pts.pop()
+        self._undone_draft_pts.append(self._draft_pts.pop())
         if not self._draft_pts:
-            self._cancel_draw()
+            # Only the on-screen draft is dropped, not _cancel_draw(): that
+            # discards the undone vertices too, and Ctrl+Y still has to be able
+            # to walk back up to the first one.
+            self._clear_draft()
         else:
             self._update_draft_path()
             if self._draft_line:
                 self.scene().removeItem(self._draft_line)
                 self._draft_line = None
+
+    def has_undone_draft_points(self) -> bool:
+        return bool(self._undone_draft_pts)
+
+    def redo_draw_point(self) -> bool:
+        """Put back the vertex undo_draw_point() took off. False if none is left."""
+        if not self._undone_draft_pts:
+            return False
+        self._draft_pts.append(self._undone_draft_pts.pop())
+        self._update_draft_path()
+        return True
+
+    def pending_mask_copy(self) -> Optional[np.ndarray]:
+        """Snapshot of the uncommitted mask, for the history stacks."""
+        return None if self._pending_mask is None else self._pending_mask.copy()
 
     def restore_pending_mask(self, mask: np.ndarray) -> None:
         """Restore pending mask from an undo snapshot."""
@@ -1224,6 +1244,8 @@ class ImageCanvas(QGraphicsView):
             if self._view_dist(sp, self._draft_pts[0]) < SNAP_DIST:
                 self._complete_draw()
                 return
+        # A fresh vertex forks the history: whatever was undone is unreachable.
+        self._undone_draft_pts.clear()
         self._draft_pts.append(sp)
         self._update_draft_path()
 
@@ -1262,6 +1284,7 @@ class ImageCanvas(QGraphicsView):
 
     def _cancel_draw(self) -> None:
         self._draft_pts.clear()
+        self._undone_draft_pts.clear()
         self._clear_draft()
 
     # ── lasso ─────────────────────────────────────────────────────────────────
