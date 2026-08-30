@@ -3,7 +3,7 @@ import contextlib
 import os
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QSize, QSettings, QItemSelectionModel
+from PyQt6.QtCore import Qt, QEvent, QSize, QSettings, QItemSelectionModel
 from PyQt6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
@@ -687,6 +687,32 @@ class MainWindow(QMainWindow):
         # the current row alone does not describe the selection.
         self._label_list.itemSelectionChanged.connect(self._on_label_selection_changed)
         self._btn_merge_labels.clicked.connect(self._merge_selected_labels)
+
+        # Space has to keep panning after a list has taken focus — see
+        # eventFilter().
+        for lst in (self._class_list, self._label_list, self._img_list):
+            lst.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Route Space to the canvas when one of the side lists has focus.
+
+        Clicking a label moves focus into the list, and QAbstractItemView
+        consumes Space for its own selection toggle, so the key never reaches
+        keyPressEvent() and the temporary pan silently stops working. The lists
+        have no use for Space — selection is driven by clicks and the arrow-key
+        actions — so it is handed to the canvas instead.
+        """
+        if obj in (self._class_list, self._label_list, self._img_list):
+            etype = event.type()
+            if (etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                    and event.key() == Qt.Key.Key_Space
+                    and not event.isAutoRepeat()):
+                if etype == QEvent.Type.KeyPress:
+                    self.canvas.keyPressEvent(event)
+                else:
+                    self.canvas.keyReleaseEvent(event)
+                return True
+        return super().eventFilter(obj, event)
 
     # ── file operations ───────────────────────────────────────────────────────
 
