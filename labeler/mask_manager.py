@@ -7,6 +7,10 @@ from typing import Dict, List, Optional, Tuple
 # Brush footprints keyed by radius — see MaskManager.brush_footprint().
 _FOOTPRINT_CACHE: Dict[int, np.ndarray] = {}
 
+# Radius from which a tip is trimmed off rather than widened. Below it the
+# shape has too few rows to give one up without turning square.
+_TRIM_FROM = 10
+
 
 @dataclass
 class Annotation:
@@ -173,11 +177,12 @@ class MaskManager:
         right — every radius, not just some. Those four spikes are what leaves
         1px bumps sticking out of a contour after painting along an edge.
 
-        Dropping any row or column that holds just one pixel shaves exactly
-        those four off and leaves a heavily rounded square, which traces an edge
-        cleanly. Small radii have no room to stay round and land on plain
-        squares (r=2 is 3x3, r=3 is 5x5); r=1 becomes a single pixel, which is
-        the useful thing to have at that size anyway.
+        Each is widened to three pixels rather than shaved off. Deleting the
+        four rows and columns that hold one pixel also works, but it costs a
+        pixel of reach on all four sides at once, and small radii have so few
+        rows that the result collapses into a plain square. Widening keeps the
+        circle its full 2r+1 across and still leaves nothing thinner than three
+        pixels for a contour to catch on.
 
         Cached per radius: this runs on every brush-size change and the result
         only depends on the radius.
@@ -191,14 +196,36 @@ class MaskManager:
         disc = np.zeros((n, n), np.uint8)
         cv2.circle(disc, (r, r), r, 1, -1)
         f = disc.astype(bool)
-        f[f.sum(axis=1) == 1, :] = False
-        f[:, f.sum(axis=0) == 1] = False
 
-        ys, xs = np.nonzero(f)
-        if ys.size == 0:                     # only possible if r collapsed away
-            f = np.ones((1, 1), dtype=bool)
-        else:
+        thin_rows = np.flatnonzero(f.sum(axis=1) == 1)
+        thin_cols = np.flatnonzero(f.sum(axis=0) == 1)
+
+        if r >= _TRIM_FROM:
+            # Big enough that a widened tip still reads as a 3px nub jutting
+            # off the rim, so drop those rows and columns instead. Losing a
+            # pixel of reach on each side is nothing at this size, and the
+            # silhouette stays round.
+            f[thin_rows, :] = False
+            f[:, thin_cols] = False
+            ys, xs = np.nonzero(f)
             f = f[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        elif r > 1:
+            # Too few rows to spare one: trimming here eats the shape and
+            # leaves a square. Widen each tip to three pixels instead, which
+            # keeps the full 2r+1 span.
+            #
+            # Both passes read the original counts: widening a row only ever
+            # adds pixels beside a tip, never inside the extreme columns, so
+            # the two cannot mask each other.
+            for y in thin_rows:
+                x = int(np.argmax(f[y]))
+                f[y, max(0, x - 1):min(n, x + 2)] = True
+            for x in thin_cols:
+                y = int(np.argmax(f[:, x]))
+                f[max(0, y - 1):min(n, y + 2), x] = True
+        # Size 1 falls through untouched: the 5px cross cv2.circle draws is all
+        # tip by construction, and at that size the tips are the tool.
+
         f = np.ascontiguousarray(f)
         _FOOTPRINT_CACHE[r] = f
         return f
