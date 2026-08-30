@@ -1151,13 +1151,15 @@ class MainWindow(QMainWindow):
             self._update_active_class()
             self.canvas.set_mode(Mode.BRUSH)
         elif action is self._act_magic:
-            if self.canvas.is_editing:
-                self.canvas.clear_edit_annotation()
-                self.canvas.set_mode(Mode.IDLE)
-                return
             self._pre_pan_action = self._act_magic
             self._update_active_class()
+            # Mode first, then drop the edit. M used to only end the edit and
+            # return, so the tool itself needed a second press; and clearing an
+            # edit while the mode is still Idle makes _on_mode_changed uncheck
+            # the tool button we are in the middle of turning on.
             self.canvas.set_mode(Mode.MAGIC)
+            if self.canvas.is_editing:
+                self.canvas.clear_edit_annotation()
         self.canvas.setFocus()
 
     def _toggle_pan(self) -> None:
@@ -1399,7 +1401,7 @@ class MainWindow(QMainWindow):
                 self.canvas.set_edit_annotation(ann_id, ann.mask)
                 self._lbl_mode.setText(
                     f"Editing: {cat.name if cat else '?'}  #{n}"
-                    "   (drag points / B=brush  M=done)"
+                    "   (drag points / B=brush  Esc=done)"
                 )
                 self._set_label_bold(row)
                 self._clear_class_bold()
