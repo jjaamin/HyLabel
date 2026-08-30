@@ -326,6 +326,149 @@ class MaskManager:
         return rgba
 
     @staticmethod
+    def _orient_like(poly: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        """poly wound the same way round as ref, so arcs walk in one direction."""
+        def signed_area(p: np.ndarray) -> float:
+            x, y = p[:, 0], p[:, 1]
+            return float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        if signed_area(poly) * signed_area(ref) < 0:
+            return poly[::-1].copy()
+        return poly
+
+    @staticmethod
+    def _runs(flags: np.ndarray) -> List[Tuple[bool, int, int]]:
+        """Maximal runs of equal flags as (value, start, end_exclusive)."""
+        edges = np.flatnonzero(np.diff(flags.astype(np.int8))) + 1
+        bounds = np.concatenate(([0], edges, [len(flags)]))
+        return [(bool(flags[bounds[i]]), int(bounds[i]), int(bounds[i + 1]))
+                for i in range(len(bounds) - 1)]
+
+    @staticmethod
+    def splice_polygons(old_polygons: List, old_mask: np.ndarray,
+                        new_mask: np.ndarray, pad: int = 2
+                        ) -> Optional[List[List[List[float]]]]:
+        """Outline of new_mask that keeps the vertices a brush stroke never reached.
+
+        A brush stroke only alters the boundary where it landed, but re-deriving
+        the whole outline from the mask replaces every authored vertex with a
+        pixel staircase — an 18-point polygon comes back as ~540 points, none of
+        them the originals. This walks the new contour, keeps the mask-derived
+        points where the stroke actually changed pixels, and substitutes the
+        original vertices everywhere else.
+
+        Returns None when the result cannot be trusted (no polygon to preserve,
+        or the spliced outline no longer describes the mask). The caller must
+        then fall back to extracting the outline from the mask wholesale.
+        """
+        olds = [np.asarray(p, dtype=np.float64)
+                for p in (old_polygons or []) if len(p) >= 3]
+        if not olds:
+            return None
+
+        changed = (old_mask > 0) ^ (new_mask > 0)
+        if not changed.any():
+            return [[[float(x), float(y)] for x, y in p] for p in olds]
+
+        # Grow the changed area so the whole newly drawn edge counts as new:
+        # the pixels just outside a stroke keep their value but their boundary
+        # is still the stroke's, and pinning those to old vertices would drag
+        # the new edge back onto the old one.
+        k = np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)
+        touched = cv2.dilate(changed.astype(np.uint8), k) > 0
+
+        contours, _ = cv2.findContours(
+            new_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        result: List[List[List[float]]] = []
+        for c in contours:
+            if len(c) < 3:
+                continue
+            pts = c.reshape(-1, 2).astype(np.float64)
+            flags = touched[pts[:, 1].astype(np.int32), pts[:, 0].astype(np.int32)]
+
+            if flags.all():
+                # Entirely new geometry (a detached blob the stroke created).
+                result.append(pts.tolist())
+                continue
+
+            old = min(olds, key=lambda o: float(
+                np.linalg.norm(o.mean(axis=0) - pts.mean(axis=0))))
+            old = MaskManager._orient_like(old, pts)
+
+            if not flags.any():
+                # Untouched contour — the authored polygon still describes it.
+                result.append([[float(x), float(y)] for x, y in old])
+                continue
+
+            spliced = MaskManager._splice_one(pts, flags, old)
+            if spliced is None:
+                return None
+            result.append(spliced)
+
+        if not result:
+            return None
+
+        # The outline is what gets saved, so verify it still draws the mask.
+        check = np.zeros_like(new_mask)
+        for poly in result:
+            if len(poly) >= 3:
+                MaskManager.fill_polygon_on(check, [(p[0], p[1]) for p in poly])
+        area = max(1, int(np.count_nonzero(new_mask)))
+        if int(np.count_nonzero((check > 0) ^ (new_mask > 0))) > max(64, area // 100):
+            return None
+        return result
+
+    @staticmethod
+    def _nearest_segment(old: np.ndarray, p: np.ndarray) -> int:
+        """Index i of the segment old[i]->old[i+1] that p lies closest to.
+
+        Segments, not vertices: on a sparse polygon the nearest vertex can be
+        half an edge away, and snapping a seam to it would cut that whole edge
+        out of the outline.
+        """
+        a = old
+        b = np.roll(old, -1, axis=0)
+        ab = b - a
+        denom = (ab * ab).sum(axis=1)
+        denom[denom == 0] = 1e-12
+        t = np.clip(((p - a) * ab).sum(axis=1) / denom, 0.0, 1.0)
+        proj = a + t[:, None] * ab
+        return int(np.argmin(np.linalg.norm(proj - p, axis=1)))
+
+    @staticmethod
+    def _splice_one(pts: np.ndarray, flags: np.ndarray,
+                    old: np.ndarray) -> Optional[List[List[float]]]:
+        """One contour: mask points where flags is True, old vertices elsewhere."""
+        # Start on a touched point so no run wraps around the array end.
+        first = int(np.argmax(flags))
+        pts = np.roll(pts, -first, axis=0)
+        flags = np.roll(flags, -first)
+        n = len(old)
+
+        out: List[List[float]] = []
+        for is_new, s, e in MaskManager._runs(flags):
+            if is_new:
+                out.extend([[float(x), float(y)] for x, y in pts[s:e]])
+                continue
+            # Untouched run. Keep its two endpoints -- they sit on the mask
+            # boundary and hold the seam in place -- and put the authored
+            # vertices back in between.
+            head, tail = pts[s], pts[e - 1]
+            ia = MaskManager._nearest_segment(old, head)
+            ib = MaskManager._nearest_segment(old, tail)
+            start = (ia + 1) % n
+            if start <= ib:
+                arc = old[start:ib + 1]
+            else:
+                arc = np.vstack((old[start:], old[:ib + 1]))
+            out.append([float(head[0]), float(head[1])])
+            out.extend([[float(x), float(y)] for x, y in arc])
+            if e - 1 != s:
+                out.append([float(tail[0]), float(tail[1])])
+
+        return out if len(out) >= 3 else None
+
+    @staticmethod
     def extract_cp_contours(mask: np.ndarray) -> List[List[Tuple[float, float]]]:
         """Full-density contour points at pixel centres (+0.5) for control-point
         dragging.

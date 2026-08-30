@@ -312,6 +312,10 @@ class ImageCanvas(QGraphicsView):
         self._brush_size: int = 20
         self._painting = False
         self._stroke_erase = False
+        # Pre-stroke state, kept so the outline can be spliced at stroke end
+        # instead of the authored vertices being thrown away wholesale.
+        self._stroke_old_mask: Optional[np.ndarray] = None
+        self._stroke_old_polygons: Optional[List] = None
 
         # polygon draft
         self._draft_pts: list = []
@@ -795,6 +799,7 @@ class ImageCanvas(QGraphicsView):
                     if self._mask_manager is not None:
                         # Settle the bbox after a stroke that may have erased.
                         self._mask_manager.recompute_bbox(self._edit_ann_id)
+                    self._splice_stroke_outline()
                     self._show_contour()  # refresh contour after brush stroke
                 self.stroke_finished.emit()
             return
@@ -1142,17 +1147,46 @@ class ImageCanvas(QGraphicsView):
     def _save_brush_undo(self) -> None:
         """Emit a snapshot of the current mask state before a brush stroke begins."""
         if self._edit_ann_id >= 0 and self._edit_mask is not None:
+            polygons = self._edit_polygons_snapshot()
+            # Same snapshot feeds the splice at stroke end, which needs to know
+            # both what the outline was and which pixels the stroke changed.
+            self._stroke_old_mask = self._edit_mask.copy()
+            self._stroke_old_polygons = polygons
             self.undo_record.emit({
                 "type": "edit_stroke",
                 "ann_id": self._edit_ann_id,
                 "mask": self._edit_mask.copy(),
-                "polygons": self._edit_polygons_snapshot(),
+                "polygons": polygons,
             })
         elif self._pending_mask is not None:
+            # Not editing an annotation, so there is no outline to splice.
+            self._stroke_old_mask = None
+            self._stroke_old_polygons = None
             self.undo_record.emit({
                 "type": "pending_brush",
                 "mask": self._pending_mask.copy(),
             })
+
+    def _splice_stroke_outline(self) -> None:
+        """Rebuild the edited outline at stroke end, keeping untouched vertices.
+
+        _do_paint drops original_polygons as soon as the mask changes, because
+        mid-stroke the mask is the only truthful description of the shape. Here
+        the stroke is over, so the authored vertices the brush never reached can
+        be put back and only the region it actually altered is left as a pixel
+        staircase. Falls back to the mask-derived outline when the splice cannot
+        be verified against the mask.
+        """
+        if (self._mask_manager is None or self._edit_ann_id < 0
+                or self._edit_mask is None or self._stroke_old_mask is None):
+            return
+        ann = self._mask_manager.get_annotation(self._edit_ann_id)
+        old_polys, self._stroke_old_polygons = self._stroke_old_polygons, None
+        old_mask, self._stroke_old_mask = self._stroke_old_mask, None
+        if ann is None or not old_polys:
+            return
+        ann.original_polygons = MaskManager.splice_polygons(
+            old_polys, old_mask, self._edit_mask)
 
     # ── polygon draw ──────────────────────────────────────────────────────────
 
