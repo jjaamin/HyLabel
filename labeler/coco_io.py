@@ -10,7 +10,11 @@ from .models import Project, ImageAnnotation, PALETTE
 from .mask_manager import MaskManager
 
 LABELME_VERSION = "1.0.1"
-_DESCRIPTION = "HyLabel - jamin"
+
+# "description" carries the class name, same as "label". AnyLabeling shows the
+# description in its label list, so a fixed tool banner there hid the class from
+# anyone opening these files elsewhere. Nothing reads it back — load_labelme()
+# builds categories from "label".
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -48,7 +52,7 @@ def save_labelme(
                                 "label": cat.name,
                                 "points": poly_pts,
                                 "group_id": None,
-                                "description": _DESCRIPTION,
+                                "description": cat.name,
                                 "shape_type": "polygon",
                                 "flags": {},
                                 "mask": None,
@@ -66,7 +70,7 @@ def save_labelme(
                             "label": cat.name,
                             "points": [[float(x), float(y)] for x, y in pts],
                             "group_id": None,
-                            "description": _DESCRIPTION,
+                            "description": cat.name,
                             "shape_type": "polygon",
                             "flags": {},
                             "mask": None,
