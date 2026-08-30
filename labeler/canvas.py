@@ -739,6 +739,19 @@ class ImageCanvas(QGraphicsView):
             self._move_control_point(ci, pi, sp)
             return
 
+        # A stroke can outlive its release: Space-panning through the release,
+        # a dialog or Alt+Tab taking the grab, or a release delivered elsewhere
+        # all leave the flag set. The brush would then keep painting along the
+        # cursor with nothing held down, so trust the live button state over
+        # the flag and close the stroke out here.
+        if (self._painting or self._lasso_drawing) and not (
+                event.buttons() & (Qt.MouseButton.LeftButton
+                                   | Qt.MouseButton.RightButton)):
+            if self._painting:
+                self._end_brush_stroke()
+            else:
+                self._complete_lasso()
+
         if self._mode == Mode.DRAW and self._draft_pts:
             last = self._draft_pts[-1]
             if self._draft_line is None:
@@ -776,6 +789,13 @@ class ImageCanvas(QGraphicsView):
         # Space-held temporary pan
         if (self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag
                 and self._mode != Mode.PAN):
+            # Pressing Space mid-stroke routes the release here. Close the
+            # stroke out anyway, or the flag survives and the next plain mouse
+            # move paints with no button held.
+            if self._painting:
+                self._end_brush_stroke()
+            elif self._lasso_drawing:
+                self._complete_lasso()
             super().mouseReleaseEvent(event)
             return
 
@@ -794,14 +814,7 @@ class ImageCanvas(QGraphicsView):
         if self._mode == Mode.BRUSH:
             if self._painting and event.button() in (
                     Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
-                self._painting = False
-                if self._edit_ann_id >= 0:
-                    if self._mask_manager is not None:
-                        # Settle the bbox after a stroke that may have erased.
-                        self._mask_manager.recompute_bbox(self._edit_ann_id)
-                    self._splice_stroke_outline()
-                    self._show_contour()  # refresh contour after brush stroke
-                self.stroke_finished.emit()
+                self._end_brush_stroke()
             return
 
         super().mouseReleaseEvent(event)
@@ -1166,6 +1179,22 @@ class ImageCanvas(QGraphicsView):
                 "type": "pending_brush",
                 "mask": self._pending_mask.copy(),
             })
+
+    def _end_brush_stroke(self) -> None:
+        """Close out a brush stroke: settle the bbox, splice the outline, notify.
+
+        Shared by the ordinary release and by the stale-stroke recovery in
+        mouseMoveEvent, so a stroke that lost its release still finishes the
+        same way instead of being silently abandoned mid-edit.
+        """
+        self._painting = False
+        if self._edit_ann_id >= 0:
+            if self._mask_manager is not None:
+                # Settle the bbox after a stroke that may have erased.
+                self._mask_manager.recompute_bbox(self._edit_ann_id)
+            self._splice_stroke_outline()
+            self._show_contour()  # refresh contour after brush stroke
+        self.stroke_finished.emit()
 
     def _splice_stroke_outline(self) -> None:
         """Rebuild the edited outline at stroke end, keeping untouched vertices.
