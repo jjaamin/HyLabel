@@ -6,11 +6,15 @@ from typing import Optional, Tuple
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
+    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QSpinBox, QVBoxLayout,
 )
 
-from .export_training import IMAGES_DIR, LABELS_DIR, CLASSES_FILE
+from .export_training import (
+    CLASSES_FILE, DEFAULT_TRAIN_RATIO, IMAGES_DIR, LABELS_DIR, SPLIT_FILE,
+    TRAIN_DIR, VAL_DIR, split_files,
+)
 
 _MAX_SIDE = 20000
 
@@ -77,19 +81,37 @@ class ExportTrainingDialog(QDialog):
         self._warn.setStyleSheet("color: #c47f00;")
         self._warn.setVisible(mixed_sizes)
 
+        split_box = QGroupBox("Train / Val 분할")
+        split_box.setCheckable(True)
+        split_box.setChecked(True)
+        self._split = split_box
+        split_form = QFormLayout(split_box)
+        self._ratio = QDoubleSpinBox()
+        self._ratio.setRange(0.05, 0.95)
+        self._ratio.setSingleStep(0.05)
+        self._ratio.setDecimals(2)
+        self._ratio.setValue(DEFAULT_TRAIN_RATIO)
+        self._ratio.setToolTip("학습에 쓸 비율. 나머지가 검증용이 됩니다.")
+        split_form.addRow("Train 비율:", self._ratio)
+        self._split_preview = QLabel()
+        self._split_preview.setStyleSheet("color: #888;")
+        split_form.addRow("", self._split_preview)
+        self._image_count = image_count
+        self._ratio.valueChanged.connect(self._update_split_preview)
+        split_box.toggled.connect(self._update_split_preview)
+        self._update_split_preview()
+
         self._auto_contrast = QCheckBox("Auto-contrast (8bit 변환 시 자동 대비)")
         self._auto_contrast.setToolTip(
             "끄면 비트 깊이 전체 범위를 그대로 8bit에 대응시킵니다 (모든 이미지에 동일한 변환).\n"
             "켜면 이미지마다 자기 데이터의 0.5~99.5 백분위로 늘립니다 — "
             "16bit 컨테이너에 12bit 데이터가 든 경우처럼 어둡게 나올 때 쓰세요.")
 
-        layout = QLabel(
-            f"출력 구조:\n"
-            f"    {IMAGES_DIR}/<이름>.png      8bit 원본 이미지\n"
-            f"    {LABELS_DIR}/<이름>.png      배경 0, 클래스는 Classes 순서대로 1, 2, 3 …\n"
-            f"    {CLASSES_FILE}            인덱스 ↔ 클래스 이름")
-        layout.setStyleSheet(
+        self._layout_hint = QLabel()
+        self._layout_hint.setStyleSheet(
             "color: #888; font-family: Consolas, monospace; font-size: 11px;")
+        split_box.toggled.connect(self._update_layout_hint)
+        self._update_layout_hint()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -106,8 +128,9 @@ class ExportTrainingDialog(QDialog):
         outer.addWidget(source)
         outer.addWidget(size_box)
         outer.addWidget(self._warn)
+        outer.addWidget(split_box)
         outer.addWidget(self._auto_contrast)
-        outer.addWidget(layout)
+        outer.addWidget(self._layout_hint)
         outer.addWidget(buttons)
 
     # ── internals ─────────────────────────────────────────────────────────────
@@ -118,6 +141,28 @@ class ExportTrainingDialog(QDialog):
         holder = QWidget()
         holder.setLayout(inner)
         return holder
+
+    def _update_split_preview(self) -> None:
+        if not self._split.isChecked():
+            self._split_preview.setText("분할하지 않고 한 폴더에 모읍니다.")
+            return
+        train, val = split_files(range(self._image_count), self._ratio.value())
+        self._split_preview.setText(
+            f"{self._image_count}장 → train {len(train)}장 / val {len(val)}장")
+
+    def _update_layout_hint(self) -> None:
+        if self._split.isChecked():
+            body = (f"    {IMAGES_DIR}/{TRAIN_DIR}/<이름>.png   8bit 원본 이미지\n"
+                    f"    {IMAGES_DIR}/{VAL_DIR}/<이름>.png\n"
+                    f"    {LABELS_DIR}/{TRAIN_DIR}/<이름>.png   배경 0, 클래스는 1, 2, 3 …\n"
+                    f"    {LABELS_DIR}/{VAL_DIR}/<이름>.png\n"
+                    f"    {CLASSES_FILE}                 인덱스 ↔ 클래스 이름\n"
+                    f"    {SPLIT_FILE}                   어느 파일이 어느 쪽인지")
+        else:
+            body = (f"    {IMAGES_DIR}/<이름>.png          8bit 원본 이미지\n"
+                    f"    {LABELS_DIR}/<이름>.png          배경 0, 클래스는 1, 2, 3 …\n"
+                    f"    {CLASSES_FILE}                 인덱스 ↔ 클래스 이름")
+        self._layout_hint.setText("출력 구조:\n" + body)
 
     def _pick_dir(self) -> None:
         start = self._dir_edit.text() or ""
@@ -158,3 +203,9 @@ class ExportTrainingDialog(QDialog):
 
     def auto_contrast(self) -> bool:
         return self._auto_contrast.isChecked()
+
+    def split_enabled(self) -> bool:
+        return self._split.isChecked()
+
+    def train_ratio(self) -> float:
+        return self._ratio.value()

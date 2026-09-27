@@ -1163,21 +1163,36 @@ class MainWindow(QMainWindow):
 
         try:
             with self._progress_dialog("Training 데이터로 내보내는 중…") as tick:
-                written, problems = export_training.export(
+                written, problems, counts = export_training.export(
                     out_dir, self.image_dir, files, self.project.categories,
                     self._annotations_for, width=width, height=height,
-                    auto_contrast=dlg.auto_contrast(), progress=tick)
+                    auto_contrast=dlg.auto_contrast(),
+                    split=dlg.split_enabled(), train_ratio=dlg.train_ratio(),
+                    progress=tick)
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
             return
 
+        if dlg.split_enabled():
+            tally = (f" (train {counts[export_training.TRAIN_DIR]} / "
+                     f"val {counts[export_training.VAL_DIR]})")
+            tree = (f"    {export_training.IMAGES_DIR}/"
+                    f"{export_training.TRAIN_DIR}, "
+                    f"{export_training.VAL_DIR}/   ({width} × {height})\n"
+                    f"    {export_training.LABELS_DIR}/"
+                    f"{export_training.TRAIN_DIR}, "
+                    f"{export_training.VAL_DIR}/\n"
+                    f"    {export_training.CLASSES_FILE}\n"
+                    f"    {export_training.SPLIT_FILE}")
+        else:
+            tally = ""
+            tree = (f"    {export_training.IMAGES_DIR}/   ({width} × {height})\n"
+                    f"    {export_training.LABELS_DIR}/\n"
+                    f"    {export_training.CLASSES_FILE}")
         self._lbl_status.setText(
-            f"Exported {written}/{len(files)} → {os.path.basename(out_dir)}/")
-        summary = (f"{written}/{len(files)}장을 내보냈습니다.\n\n"
-                   f"{out_dir}\n"
-                   f"    {export_training.IMAGES_DIR}/   ({width} × {height})\n"
-                   f"    {export_training.LABELS_DIR}/\n"
-                   f"    {export_training.CLASSES_FILE}")
+            f"Exported {written}/{len(files)}{tally} → {os.path.basename(out_dir)}/")
+        summary = (f"{written}/{len(files)}장을 내보냈습니다.{tally}\n\n"
+                   f"{out_dir}\n" + tree)
         if problems:
             shown = "\n".join(problems[:10])
             extra = len(problems) - 10

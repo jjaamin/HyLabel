@@ -1,10 +1,17 @@
 """Write a labelled folder out as an image/mask pair set a trainer can read.
 
-Two directories come out of it:
+Two directories come out of it, split into train and val by default:
 
-    <out>/images/<stem>.png   the source frame as 8-bit PNG
-    <out>/labels/<stem>.png   an 8-bit PNG whose pixel values *are* class indices
-    <out>/classes.txt         which index is which class
+    <out>/images/train/<stem>.png   the source frame as 8-bit PNG
+    <out>/images/val/<stem>.png
+    <out>/labels/train/<stem>.png   an 8-bit PNG whose values *are* class indices
+    <out>/labels/val/<stem>.png
+    <out>/classes.txt              which index is which class
+    <out>/split.txt                which file went to which side
+
+The split is decided once per filename, before anything is written, and the
+image and its label are then written under that one answer — so an image and
+its mask cannot land on opposite sides of the split.
 
 The label PNG is index-coded, not colour-coded: background is 0 and each class
 takes the number of its row in the Classes panel, starting at 1. That panel's
@@ -14,6 +21,7 @@ further down wins — the same precedence the canvas and the saved JSON use.
 from __future__ import annotations
 
 import os
+import random
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -21,7 +29,12 @@ import numpy as np
 
 IMAGES_DIR = "images"
 LABELS_DIR = "labels"
+TRAIN_DIR = "train"
+VAL_DIR = "val"
 CLASSES_FILE = "classes.txt"
+SPLIT_FILE = "split.txt"
+
+DEFAULT_TRAIN_RATIO = 0.8
 
 # An index-coded 8-bit mask cannot express more classes than this.
 MAX_CLASSES = 255
@@ -139,6 +152,35 @@ def build_label(shape: Tuple[int, int], annotations: Sequence,
     return out
 
 
+def split_files(files: Sequence[str], train_ratio: float = DEFAULT_TRAIN_RATIO,
+                seed: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    """Shuffle the names and cut them into (train, val).
+
+    Both sides keep at least one file whenever there are two or more to share,
+    because a validation set of zero is not a split and a rounding rule that can
+    empty one side is a trap on a small folder. A single file goes to train.
+    """
+    names = list(files)
+    random.Random(seed).shuffle(names)
+    count = len(names)
+    if count == 0:
+        return [], []
+    if count == 1:
+        return names, []
+    n_train = int(round(count * train_ratio))
+    n_train = max(1, min(count - 1, n_train))
+    return names[:n_train], names[n_train:]
+
+
+def write_split_file(path: str, train: Sequence[str], val: Sequence[str]) -> None:
+    """Record which file went where, so a split can be audited after the fact."""
+    lines = [f"# train {len(train)} / val {len(val)}"]
+    lines += [f"train\t{name}" for name in sorted(train)]
+    lines += [f"val\t{name}" for name in sorted(val)]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def class_index_map(categories: Sequence) -> Dict[int, int]:
     """cat_id → 1-based index, in Classes panel order. 0 is left for background."""
     return {cat.id: i for i, cat in enumerate(categories, start=1)}
@@ -155,10 +197,14 @@ def write_classes_file(path: str, categories: Sequence) -> None:
 def export(out_dir: str, image_dir: str, files: Sequence[str],
            categories: Sequence, annotations_for: Callable[[str], Sequence],
            width: Optional[int] = None, height: Optional[int] = None,
-           auto_contrast: bool = False,
+           auto_contrast: bool = False, split: bool = True,
+           train_ratio: float = DEFAULT_TRAIN_RATIO, seed: Optional[int] = None,
            progress: Optional[Callable[[int, int], None]] = None
-           ) -> Tuple[int, List[str]]:
-    """Write every file out as an image/label pair. Returns (written, problems).
+           ) -> Tuple[int, List[str], Dict[str, int]]:
+    """Write every file out as an image/label pair.
+
+    Returns (written, problems, counts) where counts gives the size of each
+    split that actually reached disk.
 
     annotations_for(filename) supplies that image's annotations; the caller
     keeps them, and passing a callable means a file with none still exports with
@@ -166,14 +212,26 @@ def export(out_dir: str, image_dir: str, files: Sequence[str],
 
     width/height are the target size. Giving only one keeps the aspect ratio;
     giving both uses them as they are; giving neither keeps each source's size.
+
+    With split on, files are shuffled and cut into train/val subdirectories
+    under both images/ and labels/. Each name is assigned a side once, up front,
+    and that same side is used for the picture and the mask.
     """
-    images_out = os.path.join(out_dir, IMAGES_DIR)
-    labels_out = os.path.join(out_dir, LABELS_DIR)
-    os.makedirs(images_out, exist_ok=True)
-    os.makedirs(labels_out, exist_ok=True)
+    if split:
+        train, val = split_files(files, train_ratio, seed)
+        side_of = dict.fromkeys(train, TRAIN_DIR) | dict.fromkeys(val, VAL_DIR)
+    else:
+        train, val = list(files), []
+        side_of = {}
+
+    sides = sorted(set(side_of.values())) or [""]
+    for side in sides:
+        os.makedirs(os.path.join(out_dir, IMAGES_DIR, side), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, LABELS_DIR, side), exist_ok=True)
 
     index_of = class_index_map(categories)
     written = 0
+    counts: Dict[str, int] = {TRAIN_DIR: 0, VAL_DIR: 0}
     problems: List[str] = []
     total = max(1, len(files))
 
@@ -193,13 +251,22 @@ def export(out_dir: str, image_dir: str, files: Sequence[str],
             label = resize_label(label, size)
 
             stem = os.path.splitext(name)[0]
-            if not cv2.imwrite(os.path.join(images_out, f"{stem}.png"), picture):
+            # One lookup, used for both files: the pair cannot be separated.
+            side = side_of.get(name, "")
+            image_path = os.path.join(out_dir, IMAGES_DIR, side, f"{stem}.png")
+            label_path = os.path.join(out_dir, LABELS_DIR, side, f"{stem}.png")
+            if not cv2.imwrite(image_path, picture):
                 problems.append(f"{name}: 이미지 저장 실패")
                 continue
-            if not cv2.imwrite(os.path.join(labels_out, f"{stem}.png"), label):
+            if not cv2.imwrite(label_path, label):
+                # The picture is already on disk; drop it so a half-written pair
+                # never reaches training as an image with no mask.
+                os.remove(image_path)
                 problems.append(f"{name}: 라벨 저장 실패")
                 continue
             written += 1
+            if side:
+                counts[side] = counts.get(side, 0) + 1
         except Exception as exc:                      # one bad file must not
             problems.append(f"{name}: {exc}")         # abandon the rest
         finally:
@@ -207,4 +274,6 @@ def export(out_dir: str, image_dir: str, files: Sequence[str],
                 progress(done, total)
 
     write_classes_file(os.path.join(out_dir, CLASSES_FILE), categories)
-    return written, problems
+    if split:
+        write_split_file(os.path.join(out_dir, SPLIT_FILE), train, val)
+    return written, problems, counts
