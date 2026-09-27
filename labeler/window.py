@@ -1,16 +1,19 @@
 from __future__ import annotations
 import contextlib
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QEvent, QSize, QSettings, QItemSelectionModel
+from PyQt6.QtCore import (
+    Qt, QEvent, QSize, QSettings, QItemSelectionModel, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence,
     QPainter, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
-    QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QGroupBox,
+    QHBoxLayout, QInputDialog,
+    QCheckBox, QDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressDialog, QPushButton, QSlider, QSplitter, QStatusBar,
     QToolBar, QVBoxLayout, QWidget,
 )
@@ -19,8 +22,13 @@ from .canvas import ImageCanvas, Mode
 from .mask_manager import MaskManager
 from .models import Project
 from . import coco_io
-from .gamma_dialog import GammaCurveDialog, compute_lut
+from .gamma_dialog import (
+    DEFAULT_CTRL, GammaCurveDialog, compute_lut, parse_ctrl, serialize_ctrl,
+)
 from . import sam_worker
+from . import edge_refine
+from . import export_training
+from .export_dialog import ExportTrainingDialog
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -61,6 +69,47 @@ def _copy_polygons(polys):
 def _color_icon(hex_color: str, size: int = 14) -> QIcon:
     pm = QPixmap(size, size)
     pm.fill(QColor(hex_color))
+    return QIcon(pm)
+
+
+# Geometry of the Classes row icon: an eye, a gap, then the colour chip. The
+# eye's width doubles as the click target — see ReorderableList.mousePressEvent.
+_EYE_W = 16
+_EYE_GAP = 3
+_CHIP_W = 12
+
+
+def _class_icon(hex_color: str, visible: bool, height: int = 14) -> QIcon:
+    """Eye toggle plus colour chip, drawn as one icon for a Classes row."""
+    pm = QPixmap(_EYE_W + _EYE_GAP + _CHIP_W, height)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    cy = height / 2
+    ink = QColor("#D0D0D0") if visible else QColor("#6E6E6E")
+    p.setPen(QPen(ink, 1.2))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    # Lens: two arcs meeting at the corners, the usual eye outline.
+    p.drawArc(int(1), int(cy - 5), _EYE_W - 2, 10, 0, 180 * 16)
+    p.drawArc(int(1), int(cy - 5), _EYE_W - 2, 10, 0, -180 * 16)
+    if visible:
+        p.setBrush(QBrush(ink))
+        p.drawEllipse(int(_EYE_W / 2 - 2), int(cy - 2), 4, 4)
+    else:
+        # Struck through rather than emptied, so the two states differ in shape
+        # and not only in shade.
+        p.drawLine(2, int(cy + 4), _EYE_W - 2, int(cy - 4))
+
+    chip_x = _EYE_W + _EYE_GAP
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(hex_color)))
+    p.drawRect(chip_x, 1, _CHIP_W, height - 2)
+    if not visible:
+        # Grey the chip down too — the row should read as off at a glance.
+        p.setBrush(QBrush(QColor(0, 0, 0, 140)))
+        p.drawRect(chip_x, 1, _CHIP_W, height - 2)
+    p.end()
     return QIcon(pm)
 
 
@@ -331,6 +380,110 @@ def _magic_wand_icon(size: int = 21) -> QIcon:
 
 
 
+class CountedGroupBox(QGroupBox):
+    """Group box showing how many rows its list holds, at the right of the title.
+
+    The count is a child label parked on the frame's top edge rather than text
+    appended to the title, which keeps it right-aligned however wide the panel
+    gets. It fills its own background so it breaks the frame line the same way
+    the title does.
+    """
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(title, parent)
+        self._count_lbl = QLabel("0", self)
+        self._count_lbl.setStyleSheet("color: #909090;")
+        self._count_lbl.setAutoFillBackground(True)
+        self._count_lbl.setContentsMargins(3, 0, 3, 0)
+
+    def set_count(self, n: int) -> None:
+        self._count_lbl.setText(str(n))
+        self._count_lbl.adjustSize()
+        self._place_count()
+
+    def _place_count(self) -> None:
+        lbl = self._count_lbl
+        y = max(0, (self.fontMetrics().height() - lbl.height()) // 2)
+        lbl.move(max(0, self.width() - lbl.width() - 8), y)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_count()
+
+
+class ReorderableList(QListWidget):
+    """List whose rows can be dragged into a new order.
+
+    The drop is reported rather than performed: rows_dropped carries the moved
+    rows and the insertion point, and the owner rearranges its own model and
+    rebuilds the widget from it. Letting Qt move the items instead would leave
+    the widget order and the model order to drift apart, and the order here is
+    not cosmetic — it decides which class wins on save.
+
+    The drop action is set to IgnoreAction so QDrag::exec() reports no move and
+    QAbstractItemView skips the removal it would otherwise do to the source
+    rows *after* this handler has already rebuilt the list.
+    """
+
+    rows_dropped = pyqtSignal(list, int)
+    eye_clicked = pyqtSignal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDropIndicatorShown(True)
+        # Pin the icon size so the eye's click zone and the drawn eye agree; left
+        # unset, the view would size rows from whatever pixmap it is handed.
+        self.setIconSize(QSize(_EYE_W + _EYE_GAP + _CHIP_W, 14))
+
+    def mousePressEvent(self, event) -> None:
+        """Clicks on the eye toggle visibility instead of selecting the row.
+
+        The eye is the left part of the row's icon, so the hit zone is measured
+        from the icon's own rect — a hard-coded width would drift the moment the
+        style's item margins differ.
+        """
+        pos = event.position().toPoint()
+        index = self.indexAt(pos)
+        if (index.isValid()
+                and event.button() == Qt.MouseButton.LeftButton
+                and pos.x() < self._eye_limit(index)):
+            self.eye_clicked.emit(index.row())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _eye_limit(self, index) -> int:
+        """Right edge of the eye's click zone, in viewport coordinates.
+
+        The icon sits a couple of style-dependent pixels in from the row's left
+        edge, so the zone runs to the gap that follows the eye. That absorbs the
+        margin without ever reaching the colour chip behind it.
+        """
+        return self.visualRect(index).left() + _EYE_W + _EYE_GAP
+
+    def dropEvent(self, event) -> None:
+        if event.source() is not self:
+            event.ignore()
+            return
+        rows = sorted({i.row() for i in self.selectedIndexes()})
+        insert_at = self._drop_row(event)
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
+        if rows:
+            self.rows_dropped.emit(rows, insert_at)
+
+    def _drop_row(self, event) -> int:
+        """Index in the current order that the dragged rows land in front of."""
+        index = self.indexAt(event.position().toPoint())
+        if not index.isValid():
+            return self.count()
+        below = (self.dropIndicatorPosition()
+                 == QAbstractItemView.DropIndicatorPosition.BelowItem)
+        return index.row() + (1 if below else 0)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -342,14 +495,20 @@ class MainWindow(QMainWindow):
         self.save_path: Optional[str] = None
         self._settings = QSettings("HyLabel", "HyLabel")
         self._last_dir: str = self._settings.value("lastDir", "")
-        y0 = int(self._settings.value("gammaY0", 0))
-        y1 = int(self._settings.value("gammaY1", 128))
-        y2 = int(self._settings.value("gammaY2", 255))
-        self._gamma_ctrl = [(0, y0), (128, y1), (255, y2)]
+        self._last_export_dir: str = self._settings.value("lastExportDir", "")
+        self._gamma_ctrl = self._load_gamma_ctrl()
         self._gamma_dialog: Optional[GammaCurveDialog] = None
         self._sam_predictor: Optional[object] = None
         self._sam_img_path: str = ""
         self._sam_model_key: str = self._settings.value("samModel", sam_worker.MODEL_EDGESAM)
+        # Edge refinement starts off every session; only the range is remembered.
+        self._refine_on: bool = False
+        self._refine_range: int = edge_refine.clamp_range(
+            self._settings.value("magicRefineRange", edge_refine.DEFAULT_SEARCH_RANGE))
+        # SAM's own output, kept so toggling refinement or moving its range can
+        # re-derive the preview without paying for another prediction.
+        self._magic_raw: Optional[object] = None
+        self._grad_cache: tuple = ("", None, None)
         if self._sam_model_key not in sam_worker.visible_models():
             self._sam_model_key = sam_worker.MODEL_EDGESAM
         self.current_img_ann = None
@@ -380,9 +539,11 @@ class MainWindow(QMainWindow):
         self._act_load_ann    = QAction("&Load from Folder…", self)
         self._act_save        = QAction("&Save", self, shortcut="Ctrl+S")
         self._act_save_as     = QAction("Save to &Folder…", self, shortcut="Ctrl+Shift+S")
+        self._act_export      = QAction("Export for &Training…", self)
         for a in (self._act_open_folder, self._act_open_file, None,
                   self._act_load_ann, None,
-                  self._act_save, self._act_save_as, None):
+                  self._act_save, self._act_save_as, None,
+                  self._act_export, None):
             fm.addSeparator() if a is None else fm.addAction(a)
         fm.addAction(QAction("E&xit", self, shortcut="Ctrl+Q", triggered=self.close))
 
@@ -578,24 +739,71 @@ class MainWindow(QMainWindow):
         mh.addWidget(self._mask_idx_lbl)
         rv.addWidget(mask_widget)
 
+        # Edge refinement row (AI Magic Wand)
+        self._refine_widget = refine_widget = QWidget()
+        rw = QVBoxLayout(refine_widget)
+        rw.setContentsMargins(4, 2, 4, 2)
+        rw.setSpacing(2)
+        self._refine_check = QCheckBox("Edge refinement  (R)")
+        self._refine_check.setStyleSheet("font-size: 13px;")
+        self._refine_check.setChecked(self._refine_on)
+        self._refine_check.setToolTip(
+            "Push the predicted contour outward onto a stronger edge.\n"
+            "Points with no clear edge are filled in from their neighbours.")
+        rw.addWidget(self._refine_check)
+        rr = QHBoxLayout()
+        rr.setContentsMargins(0, 0, 0, 0)
+        refine_lbl = QLabel("Search:")
+        refine_lbl.setStyleSheet("font-size: 13px;")
+        rr.addWidget(refine_lbl)
+        self._refine_slider = QSlider(Qt.Orientation.Horizontal)
+        self._refine_slider.setRange(edge_refine.MIN_SEARCH_RANGE,
+                                     edge_refine.MAX_SEARCH_RANGE)
+        self._refine_slider.setValue(self._refine_range)
+        self._refine_slider.setFixedHeight(24)
+        self._refine_slider.setEnabled(self._refine_on)
+        self._refine_slider.setToolTip(
+            f"How far outward to look for a better edge "
+            f"({edge_refine.MIN_SEARCH_RANGE}-{edge_refine.MAX_SEARCH_RANGE} px)")
+        rr.addWidget(self._refine_slider, 1)
+        self._refine_val_lbl = QLabel(f"{self._refine_range} px")
+        self._refine_val_lbl.setStyleSheet("font-size: 13px;")
+        self._refine_val_lbl.setFixedWidth(40)
+        rr.addWidget(self._refine_val_lbl)
+        rw.addLayout(rr)
+        rv.addWidget(refine_widget)
+
         # Classes group
-        cg = QGroupBox("Classes")
+        cg = CountedGroupBox("Classes")
         cg.setStyleSheet("QGroupBox { font-weight: normal; }")
+        self._grp_classes = cg
         cv = QVBoxLayout(cg)
-        self._class_list = QListWidget()
+        self._class_list = ReorderableList()
         self._class_list.setMaximumHeight(180)
+        self._class_list.setToolTip(
+            "Drag to reorder — later classes are written last, so they win "
+            "where regions overlap  (Ctrl+↑ / Ctrl+↓)")
         cv.addWidget(self._class_list)
         ch = QHBoxLayout()
         self._btn_add_cls = QPushButton("+ Add")
         self._btn_rem_cls = QPushButton("− Remove")
+        self._btn_cls_up = QPushButton("▲")
+        self._btn_cls_down = QPushButton("▼")
+        for b, tip in ((self._btn_cls_up, "Move class up  (Ctrl+↑)"),
+                       (self._btn_cls_down, "Move class down  (Ctrl+↓)")):
+            b.setFixedWidth(28)
+            b.setToolTip(tip)
         ch.addWidget(self._btn_add_cls)
         ch.addWidget(self._btn_rem_cls)
+        ch.addWidget(self._btn_cls_up)
+        ch.addWidget(self._btn_cls_down)
         cv.addLayout(ch)
         rv.addWidget(cg)
 
         # Labels group
-        lg = QGroupBox("Labels")
+        lg = CountedGroupBox("Labels")
         lg.setStyleSheet("QGroupBox { font-weight: normal; }")
+        self._grp_labels = lg
         lav = QVBoxLayout(lg)
         self._label_list = QListWidget()
         self._label_list.setSelectionMode(
@@ -620,9 +828,15 @@ class MainWindow(QMainWindow):
 
         # Images section — deliberately the smaller of the two lists; labelling
         # works out of Labels, and Images is mostly for jumping between files.
+        img_hdr = QHBoxLayout()
         img_lbl = QLabel("Images")
         img_lbl.setStyleSheet("margin-top: 4px;")
-        rv.addWidget(img_lbl)
+        self._img_count = QLabel("0")
+        self._img_count.setStyleSheet("margin-top: 4px; color: #909090;")
+        img_hdr.addWidget(img_lbl)
+        img_hdr.addStretch(1)
+        img_hdr.addWidget(self._img_count)
+        rv.addLayout(img_hdr)
         self._img_list = QListWidget()
         rv.addWidget(self._img_list, 1)
 
@@ -637,6 +851,8 @@ class MainWindow(QMainWindow):
         self._act_img_next = QAction(self, shortcut="PgDown")
         self._act_class_prev = QAction(self, shortcut="Up")
         self._act_class_next = QAction(self, shortcut="Down")
+        self._act_class_up = QAction(self, shortcut="Ctrl+Up")
+        self._act_class_down = QAction(self, shortcut="Ctrl+Down")
         self._act_label_prev = QAction(self, shortcut="Left")
         self._act_label_next = QAction(self, shortcut="Right")
         # Delete has to be window-level too: selecting a label switches to the
@@ -646,6 +862,10 @@ class MainWindow(QMainWindow):
         self._act_label_merge = QAction(self, shortcut="Home")
         self._act_labels_clear = QAction(self, shortcut="Ctrl+Delete")
         self._act_contours = QAction(self, shortcut="X")
+        self._act_refine = QAction(self, shortcut="R")
+        self.addAction(self._act_refine)
+        self.addAction(self._act_class_up)
+        self.addAction(self._act_class_down)
         self.addAction(self._act_brush_dec)
         self.addAction(self._act_brush_inc)
         self.addAction(self._act_pan_toggle)
@@ -678,6 +898,7 @@ class MainWindow(QMainWindow):
         self._act_open_file.triggered.connect(self._open_file)
         self._act_save.triggered.connect(self._save)
         self._act_save_as.triggered.connect(self._save_as)
+        self._act_export.triggered.connect(self._export_training)
         self._act_load_ann.triggered.connect(self._load_annotations)
         self._act_select.toggled.connect(self._on_tool_toggled)
         self._act_hand.toggled.connect(self._on_tool_toggled)
@@ -702,17 +923,26 @@ class MainWindow(QMainWindow):
         self._act_img_next.triggered.connect(lambda: self._step_list(self._img_list, +1))
         self._act_class_prev.triggered.connect(lambda: self._step_list(self._class_list, -1))
         self._act_class_next.triggered.connect(lambda: self._step_list(self._class_list, +1))
+        self._act_class_up.triggered.connect(lambda: self._nudge_class(-1))
+        self._act_class_down.triggered.connect(lambda: self._nudge_class(+1))
         self._act_label_prev.triggered.connect(lambda: self._step_list(self._label_list, -1))
         self._act_label_next.triggered.connect(lambda: self._step_list(self._label_list, +1))
         self._act_label_del.triggered.connect(self._clear_active_label)
         self._act_label_merge.triggered.connect(self._merge_selected_labels)
         self._act_labels_clear.triggered.connect(self._clear_all_labels)
         self._act_contours.triggered.connect(self._toggle_contours)
+        self._act_refine.triggered.connect(self._toggle_edge_refine)
         self._mask_slider.valueChanged.connect(self._on_mask_slider_changed)
         self._sam_model_combo.currentIndexChanged.connect(self._on_sam_model_changed)
+        self._refine_check.toggled.connect(self._on_refine_toggled)
+        self._refine_slider.valueChanged.connect(self._on_refine_range_changed)
 
         self._btn_add_cls.clicked.connect(self._add_class)
         self._btn_rem_cls.clicked.connect(self._remove_class)
+        self._btn_cls_up.clicked.connect(lambda: self._nudge_class(-1))
+        self._btn_cls_down.clicked.connect(lambda: self._nudge_class(+1))
+        self._class_list.rows_dropped.connect(self._on_classes_dropped)
+        self._class_list.eye_clicked.connect(self._toggle_class_visible)
         self._class_list.currentRowChanged.connect(self._update_active_class)
         self._class_list.currentRowChanged.connect(self._update_class_bold)
         self._class_list.clicked.connect(self._on_class_clicked)
@@ -734,6 +964,8 @@ class MainWindow(QMainWindow):
         # the current row alone does not describe the selection.
         self._label_list.itemSelectionChanged.connect(self._on_label_selection_changed)
         self._btn_merge_labels.clicked.connect(self._merge_selected_labels)
+
+        self._wire_panel_counts()
 
         # Space has to keep panning after a list has taken focus — see
         # eventFilter().
@@ -853,6 +1085,102 @@ class MainWindow(QMainWindow):
             return
         self._do_save(target)
 
+    # ── export for training ───────────────────────────────────────────────────
+
+    def _image_files(self) -> List[str]:
+        return [self._img_list.item(i).text() for i in range(self._img_list.count())]
+
+    def _annotations_for(self, filename: str):
+        """Annotations of one image, in Classes-panel order.
+
+        Read from the live mask managers rather than the saved JSON, so an
+        export reflects what is on screen without having to save first. An image
+        never opened has no manager and exports an all-background label, which
+        is correct — it has no labels.
+        """
+        img = next((i for i in self.project.images if i.file_path == filename), None)
+        if img is None:
+            return []
+        mgr = self._mask_managers.get(img.image_id)
+        return mgr.annotations() if mgr is not None else []
+
+    def _source_sizes(self, files: List[str]) -> List[Tuple[int, int]]:
+        """(w, h) of each file, from the project where known, else from the file."""
+        by_name = {i.file_path: (i.width, i.height) for i in self.project.images}
+        sizes: List[Tuple[int, int]] = []
+        for name in files:
+            size = by_name.get(name)
+            if size is None:
+                pix = QPixmap(os.path.join(self.image_dir, name))
+                if pix.isNull():
+                    continue
+                size = (pix.width(), pix.height())
+            sizes.append(size)
+        return sizes
+
+    def _export_training(self) -> None:
+        files = self._image_files()
+        if not self.image_dir or not files:
+            QMessageBox.information(self, "No Images", "먼저 이미지 폴더를 여세요.")
+            return
+        if len(self.project.categories) > export_training.MAX_CLASSES:
+            QMessageBox.warning(
+                self, "Too Many Classes",
+                f"클래스가 {len(self.project.categories)}개입니다. 인덱스로 값을 표현하는 "
+                f"8bit PNG에는 최대 {export_training.MAX_CLASSES}개까지 담을 수 있습니다.")
+            return
+        if not self.project.categories:
+            if QMessageBox.question(
+                    self, "No Classes",
+                    "클래스가 없습니다. 라벨 이미지가 전부 배경(0)으로 저장됩니다."
+                    "\n계속할까요?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        sizes = self._source_sizes(files)
+        if not sizes:
+            QMessageBox.warning(self, "Export", "이미지 크기를 읽을 수 없습니다.")
+            return
+        src_w, src_h = sizes[0]
+
+        dlg = ExportTrainingDialog(
+            src_w, src_h, len(files), mixed_sizes=len(set(sizes)) > 1,
+            start_dir=self._last_export_dir or self.image_dir, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        out_dir = dlg.out_dir()
+        width, height = dlg.target_size()
+        self._last_export_dir = out_dir
+        self._settings.setValue("lastExportDir", out_dir)
+
+        try:
+            with self._progress_dialog("Training 데이터로 내보내는 중…") as tick:
+                written, problems = export_training.export(
+                    out_dir, self.image_dir, files, self.project.categories,
+                    self._annotations_for, width=width, height=height,
+                    auto_contrast=dlg.auto_contrast(), progress=tick)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+            return
+
+        self._lbl_status.setText(
+            f"Exported {written}/{len(files)} → {os.path.basename(out_dir)}/")
+        summary = (f"{written}/{len(files)}장을 내보냈습니다.\n\n"
+                   f"{out_dir}\n"
+                   f"    {export_training.IMAGES_DIR}/   ({width} × {height})\n"
+                   f"    {export_training.LABELS_DIR}/\n"
+                   f"    {export_training.CLASSES_FILE}")
+        if problems:
+            shown = "\n".join(problems[:10])
+            extra = len(problems) - 10
+            more = f"\n… 외 {extra}건" if extra > 0 else ""
+            QMessageBox.warning(
+                self, "Export finished with problems",
+                summary + f"\n\n건너뛴 파일 {len(problems)}개:\n" + shown + more)
+        else:
+            QMessageBox.information(self, "Export complete", summary)
+
     def _save_as(self) -> None:
         default = self.image_dir or self._last_dir
         directory = QFileDialog.getExistingDirectory(
@@ -930,6 +1258,7 @@ class MainWindow(QMainWindow):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._sam_img_path = ""  # force re-encode on next magic click
+        self._magic_raw = None
 
         name = self._img_list.item(row).text()
         path = os.path.join(self.image_dir, name)
@@ -969,9 +1298,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Duplicate", f"'{name}' already exists.")
             return
         cat = self.project.add_category(name)
-        item = QListWidgetItem(_color_icon(cat.color), cat.name)
+        item = QListWidgetItem(_class_icon(cat.color, cat.visible), cat.name)
         item.setData(Qt.ItemDataRole.UserRole, cat.id)
         self._class_list.addItem(item)
+        self._style_class_row(item, cat)
         self._class_list.setCurrentRow(self._class_list.count() - 1)
         self.canvas.update_cat_colors(self._color_tuples())
         self._refresh_labels()
@@ -997,14 +1327,140 @@ class MainWindow(QMainWindow):
         self._refresh_labels()
         self._mark_modified()
 
+    # ── panel counts ──────────────────────────────────────────────────────────
+
+    def _wire_panel_counts(self) -> None:
+        """Keep each panel's row count in step with its list.
+
+        Driven off the models rather than from every site that edits a list, so
+        a number cannot drift out of date when a new call site appears.
+
+        The slot has to be a bound method of the window, not a closure: a
+        closure is kept alive by the connection alone, and the models emit while
+        the widgets are being torn down, calling it after their C++ side has
+        gone. A bound method of a QObject is dropped with its receiver instead.
+        """
+        for lst in (self._class_list, self._label_list, self._img_list):
+            model = lst.model()
+            for signal in (model.rowsInserted, model.rowsRemoved,
+                           model.modelReset, model.layoutChanged):
+                signal.connect(self._update_panel_counts)
+        self._update_panel_counts()
+
+    def _update_panel_counts(self, *_args) -> None:
+        self._grp_classes.set_count(self._class_list.count())
+        self._grp_labels.set_count(self._label_list.count())
+        self._img_count.setText(str(self._img_list.count()))
+
+    # ── class order ───────────────────────────────────────────────────────────
+    #
+    # project.categories order is the save order: sort_by_category_order() lays
+    # each image's annotations out to match, and save_labelme() writes them in
+    # that sequence. A tool that rasterises the shapes in file order therefore
+    # lets a later class paint over an earlier one, which is the priority this
+    # panel controls. The canvas shows the same precedence — rgba_region()
+    # composites in list order, mixing each later class in at OVERLAP_MIX — so
+    # the overlay has to be repainted whenever the order changes.
+
+    def _on_classes_dropped(self, rows: List[int], insert_at: int) -> None:
+        self._move_classes(rows, insert_at)
+
+    def _nudge_class(self, delta: int) -> None:
+        """Move the selected class one step up (-1) or down (+1)."""
+        row = self._class_list.currentRow()
+        target = row + delta
+        if row < 0 or not (0 <= target < len(self.project.categories)):
+            return
+        # _move_classes inserts *in front of* an index in the current order, so
+        # stepping down has to clear the neighbour as well as the row itself.
+        self._move_classes([row], target + 1 if delta > 0 else target)
+
+    def _move_classes(self, rows: List[int], insert_at: int) -> None:
+        cats = self.project.categories
+        moving = [cats[r] for r in rows if 0 <= r < len(cats)]
+        if not moving:
+            return
+        taken = set(rows)
+        rest = [c for i, c in enumerate(cats) if i not in taken]
+        # insert_at indexes the list as it stands; drop the rows removed ahead
+        # of it so the gap lands where the indicator was drawn.
+        cut = insert_at - sum(1 for r in rows if r < insert_at)
+        cut = max(0, min(cut, len(rest)))
+        new_order = rest[:cut] + moving + rest[cut:]
+        if new_order == cats:
+            return
+        self.project.categories = new_order
+        self._apply_class_order(moving[0].id)
+
+    def _apply_class_order(self, keep_cat_id: int) -> None:
+        """Re-sort every image to the new class order and rebuild the panels."""
+        cat_order = [c.id for c in self.project.categories]
+        for mgr in self._mask_managers.values():
+            mgr.sort_by_category_order(cat_order)
+        row = next((i for i, c in enumerate(self.project.categories)
+                    if c.id == keep_cat_id), 0)
+        self._class_list.blockSignals(True)
+        self._refresh_class_list()
+        self._class_list.setCurrentRow(row)
+        self._class_list.blockSignals(False)
+        self._update_active_class(row)
+        self._update_class_bold(row)
+        self._refresh_labels()
+        self._show_class_contours()
+        self.canvas.refresh_overlay()
+        self._mark_modified()
+        name = self.project.categories[row].name
+        self._lbl_status.setText(
+            f"'{name}' → 우선순위 {row + 1}/{len(self.project.categories)}")
+
     def _refresh_class_list(self) -> None:
         self._class_list.clear()
         for cat in self.project.categories:
-            item = QListWidgetItem(_color_icon(cat.color), cat.name)
+            item = QListWidgetItem(_class_icon(cat.color, cat.visible), cat.name)
             item.setData(Qt.ItemDataRole.UserRole, cat.id)
             self._class_list.addItem(item)
+            self._style_class_row(item, cat)
         if self.project.categories:
             self._class_list.setCurrentRow(0)
+        # Derived from project.categories, so rebuilding the list is also the
+        # point where a load's fresh (all visible) state reaches the canvas.
+        self._apply_class_visibility()
+
+    def _style_class_row(self, item: QListWidgetItem, cat) -> None:
+        """Grey a hidden class's name so the row reads as off, not just its eye.
+
+        A visible class gets an empty brush rather than the palette's text
+        colour: Qt maps that back to "no foreground set", which lets a selected
+        row keep the highlight's own text colour instead of staying dark on blue.
+        """
+        item.setForeground(QBrush(QColor("#8A8A8A")) if not cat.visible
+                           else QBrush())
+        item.setToolTip(f"{cat.name} — "
+                        + ("보임 (눈 아이콘 클릭 시 숨김)" if cat.visible
+                           else "숨김 (눈 아이콘 클릭 시 보임)"))
+
+    def _toggle_class_visible(self, row: int) -> None:
+        """Eye click: show or hide this class on the canvas."""
+        if not (0 <= row < len(self.project.categories)):
+            return
+        cat = self.project.categories[row]
+        cat.visible = not cat.visible
+        item = self._class_list.item(row)
+        if item is not None:
+            item.setIcon(_class_icon(cat.color, cat.visible))
+            self._style_class_row(item, cat)
+        self._apply_class_visibility()
+        state = "보임" if cat.visible else "숨김"
+        self._lbl_status.setText(f"'{cat.name}' {state}")
+
+    def _hidden_cat_ids(self) -> set:
+        return {c.id for c in self.project.categories if not c.visible}
+
+    def _apply_class_visibility(self) -> None:
+        """Push the hidden set to the canvas and redraw what depends on it."""
+        self.canvas.set_hidden_categories(self._hidden_cat_ids())
+        self._show_class_contours()
+
 
     def _update_active_class(self, row: int = -1) -> None:
         if row < 0:
@@ -1361,8 +1817,11 @@ class MainWindow(QMainWindow):
         if not (0 <= ix < mgr.width and 0 <= iy < mgr.height):
             return
 
+        # A hidden class is not on screen; letting a click land on it would
+        # select a label the user cannot see.
+        hidden = self._hidden_cat_ids()
         hits = [a for a in mgr.annotations()
-                if a.bbox is not None
+                if a.bbox is not None and a.cat_id not in hidden
                 and a.bbox[0] <= ix < a.bbox[2] and a.bbox[1] <= iy < a.bbox[3]
                 and a.mask[iy, ix]]
         if not hits:
@@ -1455,6 +1914,9 @@ class MainWindow(QMainWindow):
             self.canvas.clear_class_contours()
             return
         cat_id = self._class_list.item(row).data(Qt.ItemDataRole.UserRole)
+        if cat_id in self._hidden_cat_ids():
+            self.canvas.clear_class_contours()
+            return
         masks = [ann.mask for ann in mgr.annotations() if ann.cat_id == cat_id]
         self.canvas.show_class_contours(masks)
 
@@ -1765,7 +2227,8 @@ class MainWindow(QMainWindow):
             "draw":  "Mode: Draw  (double-click or snap to close)",
             "lasso": "Mode: Lasso  (drag to trace an outline  /  Enter: commit  /  Esc: cancel)",
             "brush": "Mode: Brush  (LMB: paint  /  RMB: erase)",
-            "magic": "Mode: AI Magic Wand  (LMB: include  /  RMB: exclude  /  Enter: commit  /  Esc: reset)",
+            "magic": ("Mode: AI Magic Wand  (LMB: include  /  RMB: exclude  /  "
+                      "R: edge refinement  /  Enter: commit  /  Esc: reset)"),
         }
         self._lbl_mode.setText(labels.get(mode_str, f"Mode: {mode_str}"))
         if mode_str == "idle":
@@ -1783,6 +2246,7 @@ class MainWindow(QMainWindow):
         self._straight_widget.setVisible(mode_str == "lasso")
         self._model_widget.setVisible(mode_str == "magic")
         self._mask_widget.setVisible(mode_str == "magic")
+        self._refine_widget.setVisible(mode_str == "magic")
 
     # ── AI magic wand (EdgeSAM / SAM2) ──────────────────────────────────────────
 
@@ -1794,6 +2258,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("samModel", key)
         self._sam_predictor = None
         self._sam_img_path = ""
+        self._magic_raw = None
         self._mask_slider.setEnabled(False)
         self.canvas.clear_magic(keep_pending=False)
         label = sam_worker.MODEL_INFO[key]["label"]
@@ -1802,6 +2267,84 @@ class MainWindow(QMainWindow):
     def _on_mask_slider_changed(self, idx: int) -> None:
         self._mask_idx_lbl.setText(f"{idx + 1}/3")
         self.canvas.set_magic_mask_idx(idx)
+
+    # ── edge refinement ───────────────────────────────────────────────────────
+
+    def _toggle_edge_refine(self) -> None:
+        """R — only while the magic wand is the active tool.
+
+        The key is a window-level action so it still works with a side list
+        focused, which means it fires in every mode; refinement means nothing
+        outside the wand, so the other modes ignore it.
+        """
+        if self.canvas.current_mode != "magic":   # current_mode is a str, not Mode
+            return
+        self._refine_check.setChecked(not self._refine_check.isChecked())
+
+    def _on_refine_toggled(self, on: bool) -> None:
+        self._refine_on = bool(on)
+        self._refine_slider.setEnabled(self._refine_on)
+        state = "ON" if self._refine_on else "OFF"
+        self._lbl_status.setText(
+            f"Edge refinement {state}  ({self._refine_range} px)")
+        self._apply_magic_masks()
+
+    def _on_refine_range_changed(self, value: int) -> None:
+        self._refine_range = edge_refine.clamp_range(value)
+        self._refine_val_lbl.setText(f"{self._refine_range} px")
+        self._settings.setValue("magicRefineRange", self._refine_range)
+        if self._refine_on:
+            self._apply_magic_masks()
+
+    def _image_gradients(self) -> Optional[tuple]:
+        """Sobel gradients of the current image, computed once and kept.
+
+        Taken from the file rather than from what is on screen: the gamma curve
+        is a viewing aid and must not move where the edges are measured.
+        """
+        item = self._img_list.currentItem()
+        if item is None or not self.image_dir:
+            return None
+        path = os.path.join(self.image_dir, item.text())
+        if self._grad_cache[0] == path:
+            return self._grad_cache[1], self._grad_cache[2]
+        import cv2
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        gx, gy = edge_refine.image_gradients(image)
+        self._grad_cache = (path, gx, gy)
+        return gx, gy
+
+    def _apply_magic_masks(self) -> None:
+        """Send SAM's masks to the canvas, refined first when that is switched on."""
+        if self._magic_raw is None:
+            return
+        if not self.canvas.has_magic_session():
+            # Esc reset the wand; the masks we still hold are stale.
+            self._magic_raw = None
+            return
+        masks = self._magic_raw
+        if self._refine_on:
+            grads = self._image_gradients()
+            if grads is None:
+                self._lbl_status.setText("Edge refinement: image unavailable")
+            else:
+                import numpy as np
+                gx, gy = grads
+                refined, moved, total = [], 0, 0
+                for m in masks:
+                    out, st = edge_refine.refine_mask(m, gx, gy, self._refine_range)
+                    refined.append(out)
+                    moved += st["moved"]
+                    total += st["points"]
+                masks = np.stack(refined)
+                if total:
+                    self._lbl_status.setText(
+                        f"Edge refined ({self._refine_range} px): "
+                        f"{moved}/{total} points found an edge, "
+                        f"{total - moved} interpolated")
+        self.canvas.set_magic_preview(masks, self._mask_slider.value())
 
     def _on_magic_requested(self, points: object, labels: object) -> None:
         if not self._ensure_sam_loaded():
@@ -1817,11 +2360,13 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         try:
             masks, scores = self._sam_predictor.predict(points, labels)  # type: ignore[union-attr]
-            self.canvas.set_magic_preview(masks, self._mask_slider.value())
+            self._magic_raw = masks
             self._mask_slider.setEnabled(True)
             score_str = "  ".join(f"{s:.2f}" for s in scores)
             self._lbl_status.setText(
                 f"AI: {len(points)} point(s)  |  scores: [{score_str}]")
+            # Refinement reports its own result over this one when it runs.
+            self._apply_magic_masks()
         except Exception as e:
             self._lbl_status.setText(f"SAM predict error: {e}")
 
@@ -1917,12 +2462,32 @@ class MainWindow(QMainWindow):
         self._gamma_dialog.lut_changed.connect(self._on_gamma_lut_changed)
         self._gamma_dialog.show()
 
+    def _load_gamma_ctrl(self) -> List[tuple]:
+        """Restore the saved tone curve, upgrading the old three-point format.
+
+        That format stored only three Y values against fixed X (0/128/255), so
+        there is no room in it for the two free interior points. Rather than
+        drop the user's curve, it is resampled at the new interior X positions —
+        the shape carries over and is editable from there.
+        """
+        saved = parse_ctrl(self._settings.value("gammaCurve", ""))
+        if saved:
+            return saved
+        old = [(0, int(self._settings.value("gammaY0", 0))),
+               (128, int(self._settings.value("gammaY1", 128))),
+               (255, int(self._settings.value("gammaY2", 255)))]
+        if old == [(0, 0), (128, 128), (255, 255)]:
+            return list(DEFAULT_CTRL)
+        lut = compute_lut(old)
+        mid = [x for x, _ in DEFAULT_CTRL[1:-1]]
+        return ([(0, old[0][1])]
+                + [(x, int(lut[x])) for x in mid]
+                + [(255, old[2][1])])
+
     def _on_gamma_lut_changed(self, lut: object) -> None:
         if self._gamma_dialog is not None:
             self._gamma_ctrl = self._gamma_dialog.control_points()
-            self._settings.setValue("gammaY0", self._gamma_ctrl[0][1])
-            self._settings.setValue("gammaY1", self._gamma_ctrl[1][1])
-            self._settings.setValue("gammaY2", self._gamma_ctrl[2][1])
+            self._settings.setValue("gammaCurve", serialize_ctrl(self._gamma_ctrl))
         self.canvas.set_gamma_lut(lut)  # type: ignore[arg-type]
 
     # ── label class change ────────────────────────────────────────────────────
@@ -2019,6 +2584,9 @@ class MainWindow(QMainWindow):
         self.current_img_ann = None
         self._class_list.clear()
         self._label_list.clear()
+        # Category ids are reissued from 1 per project, so a leftover hidden id
+        # would silently blank an unrelated class in the next one.
+        self.canvas.set_hidden_categories(set())
 
     def _mark_modified(self) -> None:
         self._modified = True

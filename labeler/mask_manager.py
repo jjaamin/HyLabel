@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Brush footprints keyed by radius — see MaskManager.brush_footprint().
 _FOOTPRINT_CACHE: Dict[int, np.ndarray] = {}
@@ -38,6 +38,11 @@ class MaskManager:
     """
 
     ALPHA = 150
+
+    # Weight a later annotation gets where it overlaps an earlier one. 0.5 is
+    # the plain average this used to do; 1.0 would hide the lower class
+    # completely. Tune here — nothing else depends on the value.
+    OVERLAP_MIX = 0.65
 
     def __init__(self, width: int, height: int) -> None:
         self.width = width
@@ -277,26 +282,48 @@ class MaskManager:
     # ── overlay rendering ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _blend_into(acc: np.ndarray, count: np.ndarray, hit: np.ndarray,
+    def _blend_over(acc: np.ndarray, seen: np.ndarray, hit: np.ndarray,
                     r: int, g: int, b: int) -> None:
-        """Accumulate one colour into acc/count wherever hit is True, in place."""
-        np.add(acc[:, :, 0], r, out=acc[:, :, 0], where=hit)
-        np.add(acc[:, :, 1], g, out=acc[:, :, 1], where=hit)
-        np.add(acc[:, :, 2], b, out=acc[:, :, 2], where=hit)
-        np.add(count, 1, out=count, where=hit)
+        """Composite one colour over acc wherever hit is True, in place.
+
+        The first annotation to reach a pixel sets it outright; each later one
+        mixes itself in at OVERLAP_MIX. A class further down the order therefore
+        reads more strongly without erasing what is under it, and the result
+        depends on the order the caller walks the annotations in.
+        """
+        first = hit & ~seen
+        over = hit & seen
+        f = MaskManager.OVERLAP_MIX
+        keep = 1.0 - f
+        for k, c in enumerate((r, g, b)):
+            ch = acc[:, :, k]
+            np.copyto(ch, float(c), where=first)
+            # acc = acc*(1-f) + c*f, as two in-place steps so that no temporary
+            # the size of the region is allocated per annotation.
+            np.multiply(ch, keep, out=ch, where=over)
+            np.add(ch, c * f, out=ch, where=over)
+        np.logical_or(seen, hit, out=seen)
 
     def rgba_region(self, x1: int, y1: int, x2: int, y2: int,
                     cat_colors: Dict[int, Tuple[int, int, int]],
                     pending_mask: Optional[np.ndarray] = None,
-                    pending_cat_id: int = -1) -> np.ndarray:
-        """RGBA composite of committed annotations + optional pending mask."""
+                    pending_cat_id: int = -1,
+                    hidden_cats: Optional[Set[int]] = None) -> np.ndarray:
+        """RGBA composite of committed annotations + optional pending mask.
+
+        Annotations are composited in list order, so the caller controls which
+        class wins an overlap — see sort_by_category_order(). Categories in
+        hidden_cats are skipped entirely; the pending mask is always drawn, so
+        hiding the class being painted does not make the brush invisible.
+        """
         h, w = y2 - y1, x2 - x1
         acc = np.zeros((h, w, 3), dtype=np.float32)
-        count = np.zeros((h, w), dtype=np.uint8)
+        seen = np.zeros((h, w), dtype=bool)
+        skip = hidden_cats or frozenset()
 
         for ann in self._annotations:
             bb = ann.bbox
-            if bb is None:
+            if bb is None or ann.cat_id in skip:
                 continue
             bx1, by1, bx2, by2 = bb
             # Reject annotations whose bounds miss the requested region entirely.
@@ -316,28 +343,27 @@ class MaskManager:
             # This is ~3x faster than boolean fancy indexing (`a[hit] += r`),
             # which allocates a gather buffer on every call.
             sub_acc = acc[iy1 - y1:iy2 - y1, ix1 - x1:ix2 - x1]
-            self._blend_into(sub_acc,
-                             count[iy1 - y1:iy2 - y1, ix1 - x1:ix2 - x1],
+            self._blend_over(sub_acc,
+                             seen[iy1 - y1:iy2 - y1, ix1 - x1:ix2 - x1],
                              hit, r, g, b)
 
         if pending_mask is not None and pending_cat_id >= 0 and pending_mask.any():
             hit = pending_mask > 0
             r, g, b = cat_colors.get(pending_cat_id, (255, 0, 0))
-            self._blend_into(acc, count, hit, r, g, b)
+            self._blend_over(acc, seen, hit, r, g, b)
 
         out = np.zeros((h, w, 4), dtype=np.uint8)
-        any_hit = count > 0
-        if any_hit.any():
-            c = count[any_hit, np.newaxis].astype(np.float32)
-            out[any_hit, :3] = np.clip(acc[any_hit] / c, 0, 255).astype(np.uint8)
-            out[any_hit, 3] = self.ALPHA
+        if seen.any():
+            out[seen, :3] = np.clip(acc[seen], 0, 255).astype(np.uint8)
+            out[seen, 3] = self.ALPHA
         return out
 
     def full_rgba(self, cat_colors: Dict[int, Tuple[int, int, int]],
                   pending_mask: Optional[np.ndarray] = None,
-                  pending_cat_id: int = -1) -> np.ndarray:
+                  pending_cat_id: int = -1,
+                  hidden_cats: Optional[Set[int]] = None) -> np.ndarray:
         return self.rgba_region(0, 0, self.width, self.height, cat_colors,
-                                pending_mask, pending_cat_id)
+                                pending_mask, pending_cat_id, hidden_cats)
 
     # ── contour / boundary helpers ────────────────────────────────────────────
 

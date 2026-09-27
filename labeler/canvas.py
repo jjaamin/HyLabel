@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
@@ -290,6 +290,9 @@ class ImageCanvas(QGraphicsView):
 
         self._mask_manager: Optional[MaskManager] = None
         self._cat_colors: Dict[int, Tuple[int, int, int]] = {}
+        # Categories the Classes panel has switched off — skipped when the
+        # overlay is composited, but still painted while pending.
+        self._hidden_cats: Set[int] = set()
         self._pending_mask: Optional[np.ndarray] = None
 
         # annotation edit state
@@ -532,7 +535,8 @@ class ImageCanvas(QGraphicsView):
         if self._overlay_item is None:
             return
         if mgr:
-            self._overlay_item.fill_all(mgr.full_rgba(cat_colors))
+            self._overlay_item.fill_all(
+                mgr.full_rgba(cat_colors, hidden_cats=self._hidden_cats))
         else:
             self._overlay_item.clear()
         if self._contour_overlay:
@@ -541,6 +545,20 @@ class ImageCanvas(QGraphicsView):
     def update_cat_colors(self, cat_colors: Dict[int, Tuple[int, int, int]]) -> None:
         self._cat_colors = cat_colors
         self._refresh_overlay_full()
+
+    def set_hidden_categories(self, hidden: Set[int]) -> None:
+        """Categories to leave out of the overlay. Colours stay registered, so
+        a hidden class still draws in its own colour once it is shown again."""
+        hidden = set(hidden)
+        # Recompositing the whole image is expensive, and the load paths call
+        # this to clear stale ids rather than because anything changed.
+        if hidden == self._hidden_cats:
+            return
+        self._hidden_cats = hidden
+        self._refresh_overlay_full()
+
+    def hidden_categories(self) -> Set[int]:
+        return set(self._hidden_cats)
 
     def refresh_overlay(self, rect: Optional[Tuple[int, int, int, int]] = None) -> None:
         """Repaint the mask overlay. Pass the affected (x1,y1,x2,y2) when known —
@@ -1114,14 +1132,16 @@ class ImageCanvas(QGraphicsView):
             return
         pm = self._pending_mask[y1:y2, x1:x2] if self._pending_mask is not None else None
         rgba = self._mask_manager.rgba_region(
-            x1, y1, x2, y2, self._cat_colors, pm, self._active_cat_id)
+            x1, y1, x2, y2, self._cat_colors, pm, self._active_cat_id,
+            self._hidden_cats)
         self._overlay_item.refresh_region(rgba, x1, y1)
 
     def _refresh_overlay_full(self) -> None:
         if not self._mask_manager or not self._overlay_item:
             return
         rgba = self._mask_manager.full_rgba(
-            self._cat_colors, self._pending_mask, self._active_cat_id)
+            self._cat_colors, self._pending_mask, self._active_cat_id,
+            self._hidden_cats)
         self._overlay_item.fill_all(rgba)
 
     def _refresh_overlay_rect(self,
@@ -1424,7 +1444,9 @@ class ImageCanvas(QGraphicsView):
                 # Erasing can only shrink the true extent; a stale-larger bbox
                 # is harmless, so recompute once at stroke end instead.
             if x2 > x1 and y2 > y1:
-                rgba = self._mask_manager.rgba_region(x1, y1, x2, y2, self._cat_colors)
+                rgba = self._mask_manager.rgba_region(
+                    x1, y1, x2, y2, self._cat_colors,
+                    hidden_cats=self._hidden_cats)
                 self._overlay_item.refresh_region(rgba, x1, y1)
             # Brush invalidates polygon precision — must extract from mask on save
             ann = self._mask_manager.get_annotation(self._edit_ann_id)
@@ -1512,6 +1534,14 @@ class ImageCanvas(QGraphicsView):
         self._magic_dot_items.append(dot)
 
         self.magic_requested.emit(list(self._magic_pts), list(self._magic_lbls))
+
+    def has_magic_session(self) -> bool:
+        """True while the wand holds click points, i.e. a live prediction.
+
+        Esc clears those here without the window hearing about it, so the window
+        asks before re-pushing a preview it still has the masks for.
+        """
+        return bool(self._magic_pts)
 
     def set_magic_preview(self, masks: np.ndarray, mask_idx: int) -> None:
         """Called by window with SAM output. masks: (3,H,W) bool-like."""

@@ -16,6 +16,9 @@ class Category:
     name: str
     color: str
     supercategory: str = ""
+    # Whether the Classes panel is showing this class on the canvas. View state
+    # only — save_labelme() does not write it, and a reload starts visible.
+    visible: bool = True
 
 
 @dataclass
