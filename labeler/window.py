@@ -1098,7 +1098,13 @@ class MainWindow(QMainWindow):
         never opened has no manager and exports an all-background label, which
         is correct — it has no labels.
         """
-        img = next((i for i in self.project.images if i.file_path == filename), None)
+        # ImageAnnotation.file_path holds a full path — load_labelme() builds it
+        # from the JSON folder and _on_image_selected() from the image folder —
+        # while the Images list holds bare names. Compare basenames, as
+        # save_labelme() does, or nothing ever matches and every label exports
+        # as background.
+        img = next((i for i in self.project.images
+                    if os.path.basename(i.file_path) == filename), None)
         if img is None:
             return []
         mgr = self._mask_managers.get(img.image_id)
@@ -1106,7 +1112,8 @@ class MainWindow(QMainWindow):
 
     def _source_sizes(self, files: List[str]) -> List[Tuple[int, int]]:
         """(w, h) of each file, from the project where known, else from the file."""
-        by_name = {i.file_path: (i.width, i.height) for i in self.project.images}
+        by_name = {os.path.basename(i.file_path): (i.width, i.height)
+                   for i in self.project.images}
         sizes: List[Tuple[int, int]] = []
         for name in files:
             size = by_name.get(name)
