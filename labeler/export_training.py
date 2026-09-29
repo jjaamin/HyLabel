@@ -219,7 +219,10 @@ def export(out_dir: str, image_dir: str, files: Sequence[str],
     """
     if split:
         train, val = split_files(files, train_ratio, seed)
-        side_of = dict.fromkeys(train, TRAIN_DIR) | dict.fromkeys(val, VAL_DIR)
+        # Built with update() rather than the dict | dict merge, which needs
+        # Python 3.9 and is not worth a version floor for one line.
+        side_of = dict.fromkeys(train, TRAIN_DIR)
+        side_of.update(dict.fromkeys(val, VAL_DIR))
     else:
         train, val = list(files), []
         side_of = {}
