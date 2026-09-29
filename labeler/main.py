@@ -1,6 +1,12 @@
 import os
 import sys
 
+# Both of these have to be set before the libraries that read them load, so they
+# sit above the imports rather than in _quiet_image_loaders() below. OpenCV reads
+# OPENCV_LOG_LEVEL once, while its logger initialises on import.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
+
 import cv2
 from PyQt6.QtWidgets import QApplication
 from .window import MainWindow
@@ -18,9 +24,18 @@ def _quiet_image_loaders() -> None:
     logger, which the Qt rule cannot reach. Raising OpenCV to ERROR keeps real
     failures visible — a missing file still returns None and bad arguments still
     raise.
+
+    The environment variables above already do this job on any build. The call
+    below is a second pass for the case where something imported cv2 before this
+    module got to set them, and it is wrapped because not every OpenCV build
+    exposes cv2.utils.logging — one that does not used to take the whole app
+    down on startup over a log setting.
     """
     os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
-    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except AttributeError:
+        pass
 
 
 def main() -> None:
