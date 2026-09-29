@@ -1045,9 +1045,16 @@ class MainWindow(QMainWindow):
         if size.isEmpty():
             return
 
-        screen = self.screen() or QApplication.primaryScreen()
+        host = self.frameGeometry()
+        # Prefer the screen the window's centre actually falls on. QWidget's own
+        # screen() reports whatever the window handle is associated with, which
+        # can still name the previous monitor after the window is dragged to
+        # another one — and clamping to the wrong screen is exactly what drags a
+        # dialog off to a different display.
+        screen = (QApplication.screenAt(host.center())
+                  or self.screen() or QApplication.primaryScreen())
         area = screen.availableGeometry() if screen is not None else None
-        dlg.move(self._centred_position(self.frameGeometry(), size, area))
+        dlg.move(self._centred_position(host, size, area))
 
     @staticmethod
     def _centred_position(host: QRect, size: QSize,
