@@ -1,11 +1,29 @@
 import os
 import sys
 
-# Both of these have to be set before the libraries that read them load, so they
-# sit above the imports rather than in _quiet_image_loaders() below. OpenCV reads
+# These have to be set before the libraries that read them load, so they sit
+# above the imports rather than in _quiet_image_loaders() below. OpenCV reads
 # OPENCV_LOG_LEVEL once, while its logger initialises on import.
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
-os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
+
+# Qt categories we have nothing to do about:
+#
+#   qt.imageformats.tiff  one line per private tag in a vendor TIFF, per file.
+#
+#   qt.qpa.window         "SetProcessDpiAwarenessContext() failed: Access is
+#                         denied", printed when something else in the process
+#                         has already fixed its DPI awareness before Qt starts.
+#                         Corporate document-security software injects a DLL
+#                         that does exactly that, and a process cannot change
+#                         its DPI awareness twice, so Qt's attempt is refused.
+#                         Qt carries on with the awareness already in force.
+#
+# Ours go first so anything the user set in their own environment is applied
+# after, and wins.
+_LOGGING_RULES = "qt.imageformats.tiff=false;qt.qpa.window.warning=false"
+_existing = os.environ.get("QT_LOGGING_RULES", "")
+os.environ["QT_LOGGING_RULES"] = (
+    f"{_LOGGING_RULES};{_existing}" if _existing else _LOGGING_RULES)
 
 import cv2
 from PyQt6.QtWidgets import QApplication
@@ -31,7 +49,6 @@ def _quiet_image_loaders() -> None:
     exposes cv2.utils.logging — one that does not used to take the whole app
     down on startup over a log setting.
     """
-    os.environ.setdefault("QT_LOGGING_RULES", "qt.imageformats.tiff=false")
     try:
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
     except AttributeError:
