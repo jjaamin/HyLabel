@@ -4,7 +4,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import (
-    Qt, QEvent, QSize, QSettings, QItemSelectionModel, pyqtSignal,
+    Qt, QEvent, QPoint, QRect, QSize, QSettings, QItemSelectionModel, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence,
@@ -972,26 +972,103 @@ class MainWindow(QMainWindow):
         for lst in (self._class_list, self._label_list, self._img_list):
             lst.installEventFilter(self)
 
+    def childEvent(self, event) -> None:
+        """Watch each new direct child so dialogs can be centred when shown.
+
+        Every popup in the app is parented to this window — including the ones
+        Qt builds inside QMessageBox and QInputDialog — so they all arrive here
+        as a ChildAdded. Filtering them from here rather than from an
+        application-wide filter keeps the canvas's mouse traffic out of Python
+        entirely: an app-wide filter measured about 6us on every mouse-move
+        event, and this measures nothing, because those events are delivered to
+        the canvas viewport and never to a direct child of this window.
+        """
+        if event.type() == QEvent.Type.ChildAdded:
+            event.child().installEventFilter(self)
+        super().childEvent(event)
+
+    # Compared against in eventFilter(), which sees every event delivered to a
+    # direct child of this window; testing the type first keeps that path to two
+    # integer comparisons for everything it does not care about.
+    _EV_SHOW = QEvent.Type.Show
+    _EV_KEY_PRESS = QEvent.Type.KeyPress
+    _EV_KEY_RELEASE = QEvent.Type.KeyRelease
+
     def eventFilter(self, obj, event) -> bool:
-        """Route Space to the canvas when one of the side lists has focus.
+        """Centre dialogs on this window, and route Space out of the side lists.
 
         Clicking a label moves focus into the list, and QAbstractItemView
         consumes Space for its own selection toggle, so the key never reaches
         keyPressEvent() and the temporary pan silently stops working. The lists
         have no use for Space — selection is driven by clicks and the arrow-key
         actions — so it is handed to the canvas instead.
+
+        Installed on the three lists and, via childEvent(), on every direct
+        child of this window. It tests the event type before anything else and
+        returns a plain False rather than calling up to the base class, whose
+        default answer is the same.
         """
-        if obj in (self._class_list, self._label_list, self._img_list):
-            etype = event.type()
-            if (etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+        etype = event.type()
+        if etype == self._EV_SHOW:
+            if isinstance(obj, QDialog):
+                self._centre_dialog(obj)
+        elif etype == self._EV_KEY_PRESS or etype == self._EV_KEY_RELEASE:
+            if (obj in (self._class_list, self._label_list, self._img_list)
                     and event.key() == Qt.Key.Key_Space
                     and not event.isAutoRepeat()):
-                if etype == QEvent.Type.KeyPress:
+                if etype == self._EV_KEY_PRESS:
                     self.canvas.keyPressEvent(event)
                 else:
                     self.canvas.keyReleaseEvent(event)
                 return True
-        return super().eventFilter(obj, event)
+        return False
+
+    def _centre_dialog(self, dlg) -> None:
+        """Put a dialog in the middle of this window.
+
+        Qt already centres a parented dialog, but it then clamps the result to a
+        screen it chooses itself, and on a multi-monitor desktop that lands the
+        box on the wrong display — the primary one, or wherever the pointer was
+        — instead of over the window the user is working in. Measuring from this
+        window's own frame puts it where they are looking.
+
+        Only the first show is moved, so a dialog the user has dragged somewhere
+        (the gamma curve is modeless and stays open) does not jump back.
+        """
+        if dlg.window() is self or dlg.property("hylabelCentred"):
+            return
+        dlg.setProperty("hylabelCentred", True)
+
+        size = dlg.frameGeometry().size()
+        if size.isEmpty():
+            size = dlg.sizeHint()
+        if size.isEmpty():
+            return
+
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else None
+        dlg.move(self._centred_position(self.frameGeometry(), size, area))
+
+    @staticmethod
+    def _centred_position(host: QRect, size: QSize,
+                          area: Optional[QRect]) -> QPoint:
+        """Top-left that centres a size-sized window on host, kept within area.
+
+        Split out from _centre_dialog() because it is the part worth testing:
+        the interesting cases are monitors at negative coordinates and windows
+        that sit off the edge of one, and neither can be staged in a real window.
+        """
+        x = host.center().x() - size.width() // 2
+        y = host.center().y() - size.height() // 2
+        if area is not None and not area.isEmpty():
+            # Only pull an axis back when the dialog actually fits along it —
+            # clamping one that is larger than the screen would push it off the
+            # opposite edge instead.
+            if size.width() <= area.width():
+                x = max(area.left(), min(x, area.right() - size.width() + 1))
+            if size.height() <= area.height():
+                y = max(area.top(), min(y, area.bottom() - size.height() + 1))
+        return QPoint(x, y)
 
     # ── file operations ───────────────────────────────────────────────────────
 
