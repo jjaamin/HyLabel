@@ -19,12 +19,21 @@
 
 ### 1. Python 설치
 
-Python 3.10 이상 필요 (개발은 3.13 기준). [python.org](https://www.python.org/downloads/) 에서 설치 시 **"Add python.exe to PATH"** 체크.
+**Python 3.8 이상** 필요 (개발·테스트는 3.13 기준). [python.org](https://www.python.org/downloads/) 에서 설치 시 **"Add python.exe to PATH"** 체크.
 
 설치 확인:
 ```bash
 python --version
 ```
+
+> 소스는 3.8 문법으로 유지합니다 — 사내 PC처럼 Python을 올리기 어려운 환경이 있어서입니다.
+> 다만 3.8은 이미 지원이 끝난 버전이라 `pip`이 그 버전을 지원하는 **마지막 패키지**를 골라
+> 설치합니다. 선택할 수 있다면 3.10 이상을 권장합니다.
+>
+> **`requirements.txt`의 하한을 올릴 때 주의하세요.** 3.8에 설치 가능한 마지막 버전이
+> `numpy 1.24.4`, `scipy 1.10.1`이라 현재 하한(`numpy>=1.24.0`, `scipy>=1.10.0`)이
+> 여유 없이 딱 맞물려 있습니다. 여기서 한 단계라도 올리면 3.8에서는 설치 자체가 실패합니다.
+> (나머지는 여유 있음: PyQt6 6.7.1 · opencv-python 5.0 · onnxruntime 1.20.1 · huggingface_hub 0.36.2)
 
 ### 2. 소스 받기
 
